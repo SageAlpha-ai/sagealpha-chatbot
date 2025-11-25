@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>SageAlpha — Chat</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+</head>
+<body>
+  <div class="app">
+
+    <!-- Top nav bar (horizontal, like ChatGPT) -->
+    <header class="top-nav">
+      <div class="brand">
+        <img src="{{ url_for('static', filename='img/sagealpha-logo.png') }}"
+             class="brand-logo" alt="SageAlpha logo" /> 
+      </div>
+      
+      <div class="top-nav-right">
+        <button id="themeToggle" class="theme-toggle" type="button" >
+          <span id="themeIcon">🌙</span>
+        </button> 
+      </div>
+    </header>
+
+    <!-- Main layout below nav: sidebar + chat area -->
+    <div class="layout">
+      <aside class="sidebar">
+        <div class="sidebar-top">
+          <button id="newChatBtn" class="new-chat">＋ New chat</button>
+        </div>
+
+        <div class="history" id="chatHistory">
+          <!-- sessions list -->
+        </div>
+
+        <div class="user-info" id="userInfo">
+          <img id="userAvatar" src="{{ url_for('static', filename='img/avatar-placeholder.png') }}" alt="avatar" />
+          <div class="user-meta">
+            <div id="username" class="username">Guest</div>
+            <div id="userEmail" class="user-email">guest@gmail.com</div>
+          </div>
+        </div>
+      </aside>
+
+      <main class="chat-area">
+        <section class="messages-wrapper">
+          <div id="messages" class="messages" aria-live="polite"></div>
+        </section>
+
+      <footer class="composer">
+        <div class="composer-inner">
+          <label class="attach-label">
+            <input type="file" id="fileInput" style="display:none" />
+            <span class="attach-icon" title="Attach file">📎</span>
+          </label>
+
+          <input id="messageBox" type="text"
+                 placeholder="Type a message or press Enter"
+                 autocomplete="off" />
+
+          <button id="sendBtn" class="send-btn">Send ➤</button>
+       </div>
+      </footer>
+      </main>
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='js/chat.js') }}"></script>
+</body>
+</html>

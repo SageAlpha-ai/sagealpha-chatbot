@@ -1,0 +1,99 @@
+# ----- Python & Flask -----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+instance/
+
+# ----- Virtual Environments -----
+env/
+venv/
+ENV/
+.venv/
+antenv/  # Conda environment for SageAlpha project
+# Add more env names if needed, e.g., myenv/
+
+# ----- Environment / Secrets -----
+.env
+*.env
+.env.local
+.env.*.local
+
+# ----- IDE & OS Files -----
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+# Windows
+ehthumbs.db
+ehthumbs_vi.db
+
+# ----- Logs & Temp Files -----
+*.log
+logs/
+tmp/
+temp/
+
+# ----- Flask / Deployment -----
+*.pid
+*.bak
+
+# ----- Testing & Coverage -----
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.profile
+
+# ----- Build & Dist -----
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ----- Jupyter Notebooks (if using) -----
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ----- ML/Data Files (for SageAlpha project) -----
+*.pkl
+*.h5
+*.hdf5
+datasets/
+models/
+checkpoints/
+data/
+raw_data/
+processed_data/
+
+# ----- Docker (if re-added later) -----
+Dockerfile*
+.dockerignore
+ .gitignore  
+ 
+uploads/.keep
+vector_store_data/.keep
