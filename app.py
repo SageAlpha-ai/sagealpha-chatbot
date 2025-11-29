@@ -1,4 +1,3 @@
-
 import os
 import io
 import json
@@ -11,6 +10,7 @@ from flask import (
     redirect, url_for, send_from_directory
 )
 from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash
 from dotenv import load_dotenv
 import pandas as pd
 from functools import wraps
@@ -29,7 +29,6 @@ from werkzeug.exceptions import HTTPException
 from flask_login import login_user, logout_user, current_user, LoginManager
 from models import db, User, Message
 from auth import auth as auth_bp  # your auth blueprint (kept)
-# register blueprint later
 
 load_dotenv()
 
@@ -74,8 +73,6 @@ if not AZURE_BLOB_CONNECTION_STRING:
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.secret_key = FLASK_SECRET
 
-# ensure instance dir and configure sqlite DB
-# Use persistent directory for Azure App Service
 # ensure DB directory and configure sqlite DB (Azure persistent)
 AZURE_DB_DIR = "/home/site/wwwroot"
 os.makedirs(AZURE_DB_DIR, exist_ok=True)
@@ -84,27 +81,72 @@ db_path = os.path.join(AZURE_DB_DIR, "sagealpha.db")
 app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{db_path}"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-
-# register auth blueprint (if you have routes there)
+# register auth blueprint
 try:
     app.register_blueprint(auth_bp)
 except Exception as e:
     print("[startup] auth blueprint register failed (maybe already registered):", e)
 
-# initialize DB & login manager
+# ---------------- DB + Login Manager Init ----------------
 db.init_app(app)
 login_manager = LoginManager()
 login_manager.init_app(app)
-# view name for login (used by login_required)
 login_manager.login_view = "login"
+
+
+def seed_demo_users():
+    """
+    Ensure database tables exist and seed demo users:
+      - demouser / DemoPass123!
+      - devuser  / DevPass123!
+      - produser / ProdPass123!
+    Only creates them if they don't already exist.
+    """
+    print("[startup] Ensuring DB tables and demo users...")
+    try:
+        db.create_all()
+        demo_users = [
+            ("demouser", "DemoUser", "DemoPass123!"),
+            ("devuser", "DevUser", "DevPass123!"),
+            ("produser", "ProductionUser", "ProdPass123!"),
+        ]
+        created_any = False
+        for username, display, pwd in demo_users:
+            existing = User.query.filter_by(username=username).first()
+            if not existing:
+                u = User(
+                    username=username,
+                    display_name=display,
+                    password_hash=generate_password_hash(pwd),
+                )
+                db.session.add(u)
+                created_any = True
+        if created_any:
+            db.session.commit()
+            print("[startup] Seeded demo users: demouser / devuser / produser")
+        else:
+            print("[startup] Demo users already exist.")
+    except Exception as e:
+        print("[startup][ERROR] Failed to seed demo users:", repr(e))
+
+
+@app.before_first_request
+def initialize():
+    """
+    Runs once in the app lifetime (per process) before handling the first request.
+    Ensures DB exists and demo users are present.
+    """
+    print("[startup] initialize() called – preparing DB & demo users...")
+    seed_demo_users()
+
 
 @login_manager.user_loader
 def load_user(user_id):
     try:
-        # the User.get may need int cast depending on your model
         return User.query.get(int(user_id))
     except Exception:
         return None
+
 
 def read_version():
     v = os.getenv("SAGEALPHA_VERSION")
@@ -116,9 +158,11 @@ def read_version():
     except Exception:
         return "0.0.0"
 
+
 @app.context_processor
 def inject_version():
     return {"APP_VERSION": read_version()}
+
 
 # Azure OpenAI client (wrap errors if missing config)
 client = AzureOpenAI(
@@ -135,6 +179,7 @@ os.makedirs(VECTOR_STORE_DIR, exist_ok=True)
 vs = VectorStore(store_dir=VECTOR_STORE_DIR)
 
 INDEX_ON_STARTUP = os.getenv("INDEX_ON_STARTUP", "false").lower() == "true"
+
 
 def startup_index():
     print("[startup] Listing metadata CSVs...")
@@ -189,6 +234,7 @@ def startup_index():
     print(f"[startup] Completed indexing metadata rows: {total_rows}")
     vs.save_index()
 
+
 if INDEX_ON_STARTUP:
     print("[startup] INDEX_ON_STARTUP=true — starting indexing...")
     try:
@@ -202,6 +248,7 @@ else:
 # ---- Simple in-memory session store for chat.js ----
 SESSIONS = {}  # session_id -> {id, title, created, messages: [{role, content, meta}]}
 
+
 def create_session(title="New chat", owner=None):
     sid = str(uuid4())
     now = datetime.utcnow().isoformat()
@@ -213,6 +260,7 @@ def create_session(title="New chat", owner=None):
         "messages": [],
     }
     return SESSIONS[sid]
+
 
 # Directory for uploaded files
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
@@ -232,6 +280,7 @@ def strip_markdown(text: str) -> str:
     text = re.sub(r"\n[-*_]{3,}\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
 
 def search_azure(query_text: str, top_k: int = 5):
     if not search_client:
@@ -267,8 +316,12 @@ def search_azure(query_text: str, top_k: int = 5):
         output.append({"doc_id": doc_id, "text": text, "meta": meta, "score": score})
     print(f"[azure] Retrieved {len(output)} docs from Azure Search.")
     for i, o in enumerate(output):
-        print(f"  [azure] {i+1}. doc_id={o['doc_id']!r} score={o['score']:.4f} source={o['meta'].get('source')!r}")
+        print(
+            f"  [azure] {i+1}. doc_id={o['doc_id']!r} "
+            f"score={o['score']:.4f} source={o['meta'].get('source')!r}"
+        )
     return output
+
 
 # ---------- Routes ----------
 @app.route("/")
@@ -278,76 +331,12 @@ def home():
         return redirect("/login")
     return render_template("index.html", APP_VERSION=read_version())
 
-# # ---------- Simple login page (GET + POST) ----------
-# @app.route("/login", methods=["GET", "POST"])
-# def login():
-#     # If user already authenticated, go to home
-#     if hasattr(current_user, "is_authenticated") and current_user.is_authenticated:
-#         return redirect("/")
-
-#     if request.method == "GET":
-#         return render_template("login.html", APP_VERSION=read_version())
-
-#     username = (request.form.get("username") or "").strip()
-#     password = request.form.get("password") or ""
-
-#     if not username or not password:
-#         return render_template("login.html", error="Username and password required.", username=username)
-
-#     # Try to load user from DB
-#     user = None
-#     try:
-#         user = User.query.filter_by(username=username).first()
-#     except Exception as e:
-#         print("[login][ERROR] DB lookup failed:", repr(e))
-#         user = None
-
-#     authenticated = False
-#     if user:
-#         if hasattr(user, "check_password") and callable(getattr(user, "check_password")):
-#             try:
-#                 authenticated = user.check_password(password)
-#             except Exception:
-#                 authenticated = False
-#         else:
-#             # dev fallback (only for local testing)
-#             try:
-#                 if getattr(user, "password", None) == password:
-#                     authenticated = True
-#             except Exception:
-#                 authenticated = False
-
-#     # Dev fallback for demo accounts
-#     if not authenticated and username in ("demouser", "devuser", "produser"):
-#         authenticated = True
-#         if not user:
-#             class _TempUser:
-#                 def __init__(self, username):
-#                     self.id = username
-#                     self.username = username
-#                     self.is_active = True
-#                 def get_id(self):
-#                     return str(self.id)
-#             user = _TempUser(username)
-
-#     if not authenticated:
-#         return render_template("login.html", error="Invalid credentials", username=username), 401
-
-#     try:
-#         login_user(user)
-#     except Exception as e:
-#         print("[login][WARN] login_user failed:", repr(e))
-#         session["logged_in"] = True
-#         session["username"] = username
-
-#     return redirect("/")
-
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
     """
     Render login page (GET), accept form POST (username/password) and sign the user in.
-    Accepts demo accounts demouser/devuser/produser for local testing.
+    Accepts demo accounts demouser/devuser/produser for local and Azure testing.
     """
     # if already logged-in via flask-login, redirect to home
     if hasattr(current_user, "is_authenticated") and current_user.is_authenticated:
@@ -362,8 +351,15 @@ def login():
     password = request.form.get("password") or ""
 
     if not username or not password:
-        # re-render with error banner (login.html has #loginError used by JS too)
-        return render_template("login.html", error="Username and password required.", username=username), 400
+        # re-render with error banner
+        return (
+            render_template(
+                "login.html",
+                error="Username and password required.",
+                username=username,
+            ),
+            400,
+        )
 
     # Try DB lookup (if models.User present)
     user = None
@@ -388,7 +384,7 @@ def login():
             except Exception:
                 authenticated = False
 
-    # Allow demo accounts for local testing
+    # Allow demo accounts as fallback (if DB missing or user not found)
     if not authenticated and username in ("demouser", "devuser", "produser"):
         authenticated = True
         if not user:
@@ -400,12 +396,21 @@ def login():
                     self.is_active = True
                     self.is_authenticated = True
                     self.is_anonymous = False
+
                 def get_id(self):
                     return str(self.id)
+
             user = _TempUser(username)
 
     if not authenticated:
-        return render_template("login.html", error="Invalid credentials", username=username), 401
+        return (
+            render_template(
+                "login.html",
+                error="Invalid username or password.",
+                username=username,
+            ),
+            401,
+        )
 
     # Perform login (flask-login) and redirect home
     try:
@@ -422,26 +427,39 @@ def login():
 @app.route("/test_search")
 def test_search():
     if not search_client:
-        return jsonify({"status": "error", "message": "search_client is None. Check AZURE_SEARCH_* env vars."})
+        return jsonify(
+            {
+                "status": "error",
+                "message": "search_client is None. Check AZURE_SEARCH_* env vars.",
+            }
+        )
     q = request.args.get("q", "cupid")
     try:
         results = search_client.search(search_text=q, top=3)
         items = []
         for r in results:
-            items.append({
-                "id": r.get("id"),
-                "score": r.get("@search.score"),
-                "path": r.get("metadata_storage_path"),
-                "content_preview": (r.get("content") or r.get("merged_content") or "")[:200],
-            })
+            items.append(
+                {
+                    "id": r.get("id"),
+                    "score": r.get("@search.score"),
+                    "path": r.get("metadata_storage_path"),
+                    "content_preview": (
+                        r.get("content") or r.get("merged_content") or ""
+                    )[:200],
+                }
+            )
         return jsonify({"status": "ok", "query": q, "results": items})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+
 @app.route("/chat", methods=["POST"])
 def chat():
     if REQUIRE_AUTH:
-        if not ((hasattr(current_user, "is_authenticated") and current_user.is_authenticated) or session.get('user')):
+        if not (
+            (hasattr(current_user, "is_authenticated") and current_user.is_authenticated)
+            or session.get("user")
+        ):
             return jsonify({"error": "Authentication required"}), 401
 
     payload = request.get_json(silent=True) or {}
@@ -450,7 +468,12 @@ def chat():
         return jsonify({"error": "Empty message"}), 400
 
     if "history" not in session:
-        session["history"] = [{"role": "system", "content": "I’m SageAlpha, a financial assistant powered by SageAlpha.ai to support your financial decisions."}]
+        session["history"] = [
+            {
+                "role": "system",
+                "content": "I’m SageAlpha, a financial assistant powered by SageAlpha.ai to support your financial decisions.",
+            }
+        ]
     history = session["history"]
     history.append({"role": "user", "content": user_msg})
 
@@ -459,14 +482,19 @@ def chat():
     if not retrieved and search_client is None:
         retrieved = vs.search(user_msg, k=top_k)
 
-    context_chunks = [f"Source: {r['meta'].get('source', r.get('doc_id'))}\n{r['text']}\n" for r in retrieved]
+    context_chunks = [
+        f"Source: {r['meta'].get('source', r.get('doc_id'))}\n{r['text']}\n"
+        for r in retrieved
+    ]
     context_text = "\n\n".join(context_chunks)[:6000]
 
-    system_prompt = ("I’m SageAlpha, a financial assistant powered by SageAlpha.ai to support your financial decisions. "
-                     "Use the provided context to answer the user's question. "
-                     "If context is insufficient, be honest and say so. "
-                     "Respond in clear plain text only. Do not use markdown formatting, "
-                     "asterisks (*), hash symbols (#), bullet lists, or code blocks.")
+    system_prompt = (
+        "I’m SageAlpha, a financial assistant powered by SageAlpha.ai to support your financial decisions. "
+        "Use the provided context to answer the user's question. "
+        "If context is insufficient, be honest and say so. "
+        "Respond in clear plain text only. Do not use markdown formatting, "
+        "asterisks (*), hash symbols (#), bullet lists, or code blocks."
+    )
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -486,19 +514,47 @@ def chat():
         history.append({"role": "assistant", "content": ai_msg})
         session["history"] = history
 
-        sources = [{"doc_id": r["doc_id"], "source": r["meta"].get("source"), "score": float(r["score"])} for r in retrieved]
+        sources = [
+            {
+                "doc_id": r["doc_id"],
+                "source": r["meta"].get("source"),
+                "score": float(r["score"]),
+            }
+            for r in retrieved
+        ]
 
         msg_id = str(uuid4())
         message_obj = {"id": msg_id, "role": "assistant", "content": ai_msg}
 
-        return jsonify({"id": msg_id, "response": ai_msg, "message": message_obj, "data": message_obj, "sources": sources})
+        return jsonify(
+            {
+                "id": msg_id,
+                "response": ai_msg,
+                "message": message_obj,
+                "data": message_obj,
+                "sources": sources,
+            }
+        )
 
     except Exception as e:
         error_msg = f"Backend error: {str(e)}"
         msg_id = str(uuid4())
         message_obj = {"id": msg_id, "role": "assistant", "content": error_msg}
         print("[chat][ERROR]", repr(e))
-        return jsonify({"id": msg_id, "response": error_msg, "message": message_obj, "data": message_obj, "sources": [], "error": str(e)}), 500
+        return (
+            jsonify(
+                {
+                    "id": msg_id,
+                    "response": error_msg,
+                    "message": message_obj,
+                    "data": message_obj,
+                    "sources": [],
+                    "error": str(e),
+                }
+            ),
+            500,
+        )
+
 
 @app.route("/query", methods=["POST"])
 def query():
@@ -527,7 +583,9 @@ def query():
             meta = {"source": f"pdf_temp:{att}", "attachment": att}
             temp_doc_id = f"temp_pdf::{att}"
             try:
-                vs.add_temporary_document(doc_id=temp_doc_id, text=extracted, meta=meta)
+                vs.add_temporary_document(
+                    doc_id=temp_doc_id, text=extracted, meta=meta
+                )
             except Exception:
                 pass
         except Exception as e:
@@ -538,11 +596,17 @@ def query():
     else:
         final_results = vs.search(q, k=top_k)
 
-    context_chunks = [f"Source: {r['meta'].get('source', r['doc_id'])}\n{r['text']}" for r in final_results]
+    context_chunks = [
+        f"Source: {r['meta'].get('source', r['doc_id'])}\n{r['text']}"
+        for r in final_results
+    ]
     context_text = "\n\n".join(context_chunks)[:6000]
 
     messages = [
-        {"role": "system", "content": "I’m SageAlpha, a financial assistant using smart financial models to guide your decisions."},
+        {
+            "role": "system",
+            "content": "I’m SageAlpha, a financial assistant using smart financial models to guide your decisions.",
+        },
         {"role": "system", "content": f"Context:\n{context_text}"},
         {"role": "user", "content": q},
     ]
@@ -562,7 +626,14 @@ def query():
         except Exception:
             pass
 
-        sources = [{"doc_id": r["doc_id"], "source": r["meta"].get("source"), "score": float(r.get("score", 0.0))} for r in final_results]
+        sources = [
+            {
+                "doc_id": r["doc_id"],
+                "source": r["meta"].get("source"),
+                "score": float(r.get("score", 0.0)),
+            }
+            for r in final_results
+        ]
         return jsonify({"answer": ai_msg, "sources": sources})
     except Exception as e:
         try:
@@ -571,6 +642,7 @@ def query():
             pass
         print("[query][ERROR]", repr(e))
         return jsonify({"error": str(e)}), 500
+
 
 # --- REPORT HTML endpoint used by client-side PDF generator ---
 @app.route("/report-html", methods=["GET"])
@@ -603,17 +675,27 @@ def report_html():
             return resp
 
         # Extract <head> and <body> pieces
-        head_match = re.search(r"<head[^>]*>([\\s\\S]*?)</head>", html, flags=re.IGNORECASE)
-        body_match = re.search(r"<body[^>]*>([\\s\\S]*?)</body>", html, flags=re.IGNORECASE)
+        head_match = re.search(
+            r"<head[^>]*>([\s\S]*?)</head>", html, flags=re.IGNORECASE
+        )
+        body_match = re.search(
+            r"<body[^>]*>([\s\S]*?)</body>", html, flags=re.IGNORECASE
+        )
 
         head_html = head_match.group(1) if head_match else ""
         body_html = body_match.group(1) if body_match else html  # fallback: entire html
 
         # Extract inline <style> content from head
-        style_blocks = re.findall(r"<style[^>]*>([\\s\\S]*?)</style>", head_html, flags=re.IGNORECASE)
+        style_blocks = re.findall(
+            r"<style[^>]*>([\s\S]*?)</style>", head_html, flags=re.IGNORECASE
+        )
 
         # Extract link rel=stylesheet tags (keep them so iframe can load external css)
-        link_tags = re.findall(r"<link[^>]*rel=[\"']stylesheet[\"'][^>]*>", head_html, flags=re.IGNORECASE)
+        link_tags = re.findall(
+            r"<link[^>]*rel=[\"']stylesheet[\"'][^>]*>",
+            head_html,
+            flags=re.IGNORECASE,
+        )
 
         # IMPORTANT: Inject a small print CSS to ensure colors and layout are preserved during capture
         injected_print_css = """
@@ -643,16 +725,12 @@ def report_html():
         # Build link tags HTML (convert relative href to absolute URL so iframe can load)
         processed_links = []
         for lt in link_tags:
-            # try to replace relative href with absolute using url_for if possible
             href_match = re.search(r'href=[\'"]([^\'"]+)[\'"]', lt)
             if href_match:
                 href = href_match.group(1)
-                if href.startswith('/'):
-                    # absolute on same host, keep as-is
+                if href.startswith("/"):
                     processed_links.append(lt)
                 else:
-                    # attempt to make it absolute by prefixing static path (best-effort)
-                    # if href already points to static, leave it; else leave original tag
                     processed_links.append(lt)
             else:
                 processed_links.append(lt)
@@ -677,7 +755,7 @@ def report_html():
         print("[report-html][ERROR]", repr(e))
         return jsonify({"error": "Failed to render report HTML: " + str(e)}), 500
 
-        
+
 @app.route("/refresh", methods=["POST"])
 def refresh():
     try:
@@ -686,10 +764,12 @@ def refresh():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/reset_history", methods=["POST"])
 def reset_history():
     session.pop("history", None)
     return jsonify({"status": "cleared"})
+
 
 @app.errorhandler(Exception)
 def handle_exception(e):
@@ -699,24 +779,48 @@ def handle_exception(e):
     print("[ERROR]", repr(e))
     return jsonify({"error": str(e)}), code
 
+
 @app.route("/user", methods=["GET"])
 def user():
     if hasattr(current_user, "is_authenticated") and current_user.is_authenticated:
-        return jsonify({"username": current_user.username, "email": f"{current_user.username}@local", "avatar_url": None})
-    return jsonify({"username": "Guest", "email": "guest@gmail.com", "avatar_url": None})
+        return jsonify(
+            {
+                "username": current_user.username,
+                "email": f"{current_user.username}@local",
+                "avatar_url": None,
+            }
+        )
+    return jsonify(
+        {"username": "Guest", "email": "guest@gmail.com", "avatar_url": None}
+    )
+
 
 @app.route("/sessions", methods=["GET"])
 def list_sessions():
     out = []
-    sessions_sorted = sorted(SESSIONS.values(), key=lambda x: x["created"], reverse=True)
+    sessions_sorted = sorted(
+        SESSIONS.values(), key=lambda x: x["created"], reverse=True
+    )
     for s in sessions_sorted:
         if REQUIRE_AUTH:
-            if not (hasattr(current_user, "is_authenticated") and current_user.is_authenticated):
+            if not (
+                hasattr(current_user, "is_authenticated")
+                and current_user.is_authenticated
+            ):
                 continue
             if s.get("owner") != current_user.username:
                 continue
-        out.append({"id": s["id"], "title": s["title"], "created": s["created"], "owner": s.get("owner"), "message_count": len(s.get("messages", []))})
+        out.append(
+            {
+                "id": s["id"],
+                "title": s["title"],
+                "created": s["created"],
+                "owner": s.get("owner"),
+                "message_count": len(s.get("messages", [])),
+            }
+        )
     return jsonify({"sessions": out})
+
 
 @app.route("/sessions", methods=["POST"])
 def create_session_route():
@@ -730,17 +834,22 @@ def create_session_route():
     s = create_session(title, owner=owner)
     return jsonify({"session": s}), 201
 
+
 @app.route("/sessions/<session_id>", methods=["GET"])
 def get_session(session_id):
     s = SESSIONS.get(session_id)
     if not s:
         return jsonify({"error": "Session not found"}), 404
     if REQUIRE_AUTH:
-        if not (hasattr(current_user, "is_authenticated") and current_user.is_authenticated):
+        if not (
+            hasattr(current_user, "is_authenticated")
+            and current_user.is_authenticated
+        ):
             return jsonify({"error": "Authentication required"}), 401
         if s.get("owner") != current_user.username:
             return jsonify({"error": "Session not found"}), 404
     return jsonify({"session": s})
+
 
 @app.route("/sessions/<session_id>/rename", methods=["POST"])
 def rename_session(session_id):
@@ -748,7 +857,10 @@ def rename_session(session_id):
     if not s:
         return jsonify({"error": "Session not found"}), 404
     if REQUIRE_AUTH:
-        if not (hasattr(current_user, "is_authenticated") and current_user.is_authenticated):
+        if not (
+            hasattr(current_user, "is_authenticated")
+            and current_user.is_authenticated
+        ):
             return jsonify({"error": "Authentication required"}), 401
         if s.get("owner") != current_user.username:
             return jsonify({"error": "Session not found"}), 404
@@ -757,6 +869,7 @@ def rename_session(session_id):
     if title:
         s["title"] = title
     return jsonify({"session": s})
+
 
 @app.route("/chat_session", methods=["POST"])
 def chat_session():
@@ -769,12 +882,22 @@ def chat_session():
     if session_id and session_id in SESSIONS:
         s = SESSIONS[session_id]
         if REQUIRE_AUTH:
-            if not (hasattr(current_user, "is_authenticated") and current_user.is_authenticated):
+            if not (
+                hasattr(current_user, "is_authenticated")
+                and current_user.is_authenticated
+            ):
                 return jsonify({"error": "Authentication required"}), 401
             if s.get("owner") and s.get("owner") != current_user.username:
                 return jsonify({"error": "Session not found"}), 404
     else:
-        owner = current_user.username if (hasattr(current_user, "is_authenticated") and current_user.is_authenticated) else None
+        owner = (
+            current_user.username
+            if (
+                hasattr(current_user, "is_authenticated")
+                and current_user.is_authenticated
+            )
+            else None
+        )
         if REQUIRE_AUTH and not owner:
             return jsonify({"error": "Authentication required"}), 401
         s = create_session("New chat", owner=owner)
@@ -787,16 +910,25 @@ def chat_session():
     if not retrieved and search_client is None:
         retrieved = vs.search(user_msg, k=top_k)
 
-    context_chunks = [f"Source: {r['meta'].get('source', r.get('doc_id'))}\n{r['text']}" for r in retrieved]
+    context_chunks = [
+        f"Source: {r['meta'].get('source', r.get('doc_id'))}\n{r['text']}"
+        for r in retrieved
+    ]
     context_text = "\n\n".join(context_chunks)[:6000]
 
-    system_prompt = ("I’m SageAlpha, a financial assistant using smart financial models to guide your decisions. "
-                     "Use the provided context to answer the user's question. "
-                     "If context is insufficient, be honest and say so. "
-                     "Respond in clear plain text only. Do not use markdown formatting, asterisks (*), hash symbols (#), "
-                     "bullet lists, or code blocks.")
+    system_prompt = (
+        "I’m SageAlpha, a financial assistant using smart financial models to guide your decisions. "
+        "Use the provided context to answer the user's question. "
+        "If context is insufficient, be honest and say so. "
+        "Respond in clear plain text only. Do not use markdown formatting, asterisks (*), hash symbols (#), "
+        "bullet lists, or code blocks."
+    )
 
-    messages = [{"role": "system", "content": system_prompt}, {"role": "system", "content": f"Context:\n{context_text}"}, {"role": "user", "content": user_msg}]
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": f"Context:\n{context_text}"},
+        {"role": "user", "content": user_msg},
+    ]
 
     try:
         resp = client.chat.completions.create(
@@ -809,16 +941,28 @@ def chat_session():
         ai_msg = resp.choices[0].message.content
         s["messages"].append({"role": "assistant", "content": ai_msg, "meta": {}})
 
-        sources = [{"doc_id": r["doc_id"], "source": r["meta"].get("source"), "score": float(r["score"])} for r in retrieved]
+        sources = [
+            {
+                "doc_id": r["doc_id"],
+                "source": r["meta"].get("source"),
+                "score": float(r["score"]),
+            }
+            for r in retrieved
+        ]
 
         return jsonify({"session_id": session_id, "response": ai_msg, "sources": sources})
     except Exception as e:
         print("[chat_session][ERROR]", repr(e))
-        s["messages"].append({"role": "assistant", "content": f"Backend error: {e}", "meta": {}})
+        s["messages"].append(
+            {"role": "assistant", "content": f"Backend error: {e}", "meta": {}}
+        )
+        return jsonify({"error": str(e)}), 500
+
 
 # ---- start server when run directly ----
 if __name__ == "__main__":
     import sys
+
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", 8000))
     debug_env = os.getenv("FLASK_DEBUG", "1")
@@ -827,9 +971,10 @@ if __name__ == "__main__":
     try:
         with app.app_context():
             db.create_all()
-            print("[startup] Database tables ensured (sqlite).")
+            seed_demo_users()
+            print("[startup] Database tables ensured (sqlite) and demo users seeded.")
     except Exception as e:
-        print("[startup][WARN] Failed to create DB tables:", repr(e))
+        print("[startup][WARN] Failed to create DB tables or seed users:", repr(e))
 
     print(f"[startup] Starting Flask app on http://{host}:{port}  (debug={debug})")
     try:
