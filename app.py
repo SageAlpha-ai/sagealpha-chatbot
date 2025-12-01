@@ -41,11 +41,11 @@ FLASK_SECRET = os.getenv("FLASK_SECRET") or os.urandom(24).hex()
 
 REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "true").lower() in ("1", "true", "yes")
 
-
 # Azure Cognitive Search config
 AZURE_SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT")
 AZURE_SEARCH_KEY = os.getenv("AZURE_SEARCH_KEY")
 AZURE_SEARCH_INDEX = os.getenv("AZURE_SEARCH_INDEX", "azureblob-index")
+AZURE_SEARCH_SEMANTIC_CONFIG = os.getenv("AZURE_SEARCH_SEMANTIC_CONFIG")  # e.g. "default"
 
 if not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_API_KEY or not AZURE_OPENAI_DEPLOYMENT:
     print("[WARN] Missing Azure OpenAI configuration – chat may not work correctly.")
@@ -68,26 +68,22 @@ if AZURE_SEARCH_ENDPOINT and AZURE_SEARCH_KEY and AZURE_SEARCH_INDEX:
 else:
     print("[startup] Azure Search client not initialized.")
 
-if not AZURE_BLOB_CONNECTION_STRING:
-    print("[WARN] Missing AZURE_BLOB_CONNECTION_STRING – blob features disabled.")
-
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.secret_key = FLASK_SECRET
 
-# ensure DB directory and configure sqlite DB (works locally and on Azure App Service)
 if os.getenv("WEBSITE_SITE_NAME"):
     # We are running on Azure App Service
-    DB_DIR = "/home/site/wwwroot"
+    DB_DIR = "/home/data"   # <── ALWAYS writable on Azure
 else:
     # Local dev: keep DB file in the project folder
     DB_DIR = os.path.dirname(__file__)
 
+# Ensure the directory exists
 os.makedirs(DB_DIR, exist_ok=True)
 
 db_path = os.path.join(DB_DIR, "sagealpha.db")
 app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{db_path}"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
 
 # register auth blueprint
 try:
@@ -138,18 +134,9 @@ def seed_demo_users():
         print("[startup][ERROR] Failed to seed demo users:", repr(e))
 
 
-@app.before_first_request
-def initialize():
-    """
-    Runs once in the app lifetime (per process) before handling the first request.
-    Ensures DB exists and demo users are present.
-    """
-    print("[startup] initialize() called – preparing DB & demo users...")
-    seed_demo_users()
-
-
 @login_manager.user_loader
 def load_user(user_id):
+    # Keep it simple: expect integer primary keys
     try:
         return User.query.get(int(user_id))
     except Exception:
@@ -171,16 +158,34 @@ def read_version():
 def inject_version():
     return {"APP_VERSION": read_version()}
 
+# ---------- Azure OpenAI client (safe init) ----------
+client = None
+if AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY:
+    try:
+        client = AzureOpenAI(
+            azure_endpoint=AZURE_OPENAI_ENDPOINT,
+            api_key=AZURE_OPENAI_API_KEY,
+            api_version=AZURE_OPENAI_API_VERSION,
+        )
+        print("[startup] AzureOpenAI client initialized.")
+    except Exception as e:
+        client = None
+        print("[startup][WARN] Failed to initialize AzureOpenAI client:", repr(e))
+else:
+    print("[startup][WARN] Azure OpenAI configuration incomplete – LLM calls will be disabled.")
 
-# Azure OpenAI client (wrap errors if missing config)
-client = AzureOpenAI(
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_key=AZURE_OPENAI_API_KEY,
-    api_version=AZURE_OPENAI_API_VERSION,
-)
-
+# ---------- BlobReader (safe init) ----------
 BLOB_CONTAINER = "nse-data-raw"
-blob_reader = BlobReader(conn_str=AZURE_BLOB_CONNECTION_STRING, container=BLOB_CONTAINER)
+blob_reader = None
+if AZURE_BLOB_CONNECTION_STRING:
+    try:
+        blob_reader = BlobReader(conn_str=AZURE_BLOB_CONNECTION_STRING, container=BLOB_CONTAINER)
+        print("[startup] BlobReader initialized.")
+    except Exception as e:
+        blob_reader = None
+        print("[startup][WARN] Failed to initialize BlobReader:", repr(e))
+else:
+    print("[WARN] Missing AZURE_BLOB_CONNECTION_STRING – blob features disabled.")
 
 VECTOR_STORE_DIR = "vector_store_data"
 os.makedirs(VECTOR_STORE_DIR, exist_ok=True)
@@ -190,6 +195,10 @@ INDEX_ON_STARTUP = os.getenv("INDEX_ON_STARTUP", "false").lower() == "true"
 
 
 def startup_index():
+    if not blob_reader:
+        print("[startup] BlobReader not initialized; skipping indexing.")
+        return
+
     print("[startup] Listing metadata CSVs...")
     csv_prefix = "metadata/"
     csv_blobs = blob_reader.list_blobs(prefix=csv_prefix)
@@ -254,7 +263,7 @@ else:
     print("[startup] Skipped indexing on startup (INDEX_ON_STARTUP=false).")
 
 # ---- Simple in-memory session store for chat.js ----
-SESSIONS = {}  # session_id -> {id, title, created, messages: [{role, content, meta}]}
+SESSIONS = {}  # session_id -> {id, title, created, messages: [{role, content, meta}], sections, current_topic}
 
 
 def create_session(title="New chat", owner=None):
@@ -266,6 +275,8 @@ def create_session(title="New chat", owner=None):
         "created": now,
         "owner": owner,
         "messages": [],
+        "sections": [],      # section-wise Q&A memory
+        "current_topic": "", # current company/topic for this session
     }
     return SESSIONS[sid]
 
@@ -290,16 +301,87 @@ def strip_markdown(text: str) -> str:
     return text.strip()
 
 
+def extract_topic(user_msg: str, last_topic: str | None = None) -> str | None:
+    """
+    Very simple topic extractor.
+
+    Goal:
+      - When user types 'cupid limited' or 'tata motors' → treat that as a new topic.
+      - When user types 'give owner name' or 'who is the owner' → keep using last topic.
+    """
+    if not user_msg:
+        return last_topic
+
+    text = user_msg.strip().lower()
+    tokens = re.findall(r"[a-z0-9]+", text)
+    if not tokens:
+        return last_topic
+
+    # Generic question-style prompts – don't change topic
+    question_starts = {
+        "who",
+        "what",
+        "which",
+        "when",
+        "where",
+        "why",
+        "how",
+        "give",
+        "tell",
+        "show",
+        "explain",
+        "owner",
+        "ceo",
+        "chairman",
+        "md",
+        "director",
+    }
+    if tokens[0] in question_starts:
+        return last_topic
+
+    # Short phrase (1–4 words) that is not just a generic question → assume new topic
+    if len(tokens) <= 4:
+        return text
+
+    # For longer sentences, keep the last topic (LLM + search will still see full question)
+    return last_topic
+
+
 def search_azure(query_text: str, top_k: int = 5):
+    """
+    Search Azure Cognitive Search index and return docs in unified shape:
+    [
+      {
+        "doc_id": str,
+        "text": str,
+        "meta": {...},
+        "score": float
+      },
+      ...
+    ]
+    Uses semantic search if AZURE_SEARCH_SEMANTIC_CONFIG is set.
+    """
     if not search_client:
         print("[azure] search_client is None. Check AZURE_SEARCH_* env vars.")
         return []
     if not query_text:
         print("[azure] Empty query_text.")
         return []
+
     print(f"[azure] Searching index '{AZURE_SEARCH_INDEX}' for query: {query_text!r}")
+
+    search_kwargs = {
+        "search_text": query_text,
+        "top": top_k,
+    }
+
+    if AZURE_SEARCH_SEMANTIC_CONFIG:
+        search_kwargs["query_type"] = "semantic"
+        search_kwargs["semantic_configuration_name"] = AZURE_SEARCH_SEMANTIC_CONFIG
+        print(f"[azure] Using semantic configuration: {AZURE_SEARCH_SEMANTIC_CONFIG}")
+
     try:
-        results = search_client.search(search_text=query_text, top=top_k)
+        results = search_client.search(**search_kwargs)
     except Exception as e:
         print(f"[azure] search error: {e}")
         return []
@@ -331,11 +413,95 @@ def search_azure(query_text: str, top_k: int = 5):
     return output
 
 
+def build_session_memory_sections(sections, current_topic: str | None,
+                                  limit: int = 5, max_chars: int = 1500):
+    """
+    Build a compact 'session memory' string from previous Q&A sections.
+
+    If current_topic is set:
+      - Prefer only those Q&A where this topic appears in query or answer.
+      - This prevents mixing 'Cupid Limited' memory into 'Tata Motors' queries.
+
+    If no topic or nothing matches:
+      - Fall back to last N sections of the chat.
+    """
+    if not sections:
+        return ""
+
+    normalized_topic = (current_topic or "").lower().strip()
+
+    filtered = []
+    if normalized_topic:
+        for s in sections:
+            q = (s.get("query") or "").lower()
+            a = (s.get("answer") or "").lower()
+            if normalized_topic in q or normalized_topic in a:
+                filtered.append(s)
+
+    if not filtered:
+        # No topic match → use last N overall
+        filtered = sections[-limit:]
+    else:
+        filtered = filtered[-limit:]
+
+    parts = []
+    for s in filtered:
+        parts.append(
+            f"[{s.get('timestamp','')}] Q: {s.get('query','')}\nA: {s.get('answer','')}"
+        )
+
+    memory_text = "\n\n".join(parts)
+    return memory_text[:max_chars]
+
+
+def build_hybrid_messages(user_msg: str, retrieved_docs, extra_system_msgs=None):
+    """
+    Build messages for hybrid RAG:
+    - If there are relevant search results (score above threshold),
+      include them as Context.
+    - If not, leave Context empty and let the LLM answer from its own knowledge.
+    """
+    relevance_threshold = 0.35
+    relevant_docs = [r for r in retrieved_docs if r.get("score", 0.0) >= relevance_threshold]
+
+    if relevant_docs:
+        context_chunks = [
+            f"Source: {r['meta'].get('source', r['doc_id'])}\n{r['text']}"
+            for r in relevant_docs
+            if r.get("text")
+        ]
+        context_text = "\n\n".join(context_chunks)[:6000]
+        print("[hybrid] Using RAG mode with context_length:", len(context_text))
+    else:
+        context_text = ""
+        print("[hybrid] No relevant docs found – using pure LLM mode.")
+
+    system_prompt = (
+        "You are SageAlpha, a financial assistant powered by SageAlpha.ai.\n"
+        "Use this logic:\n"
+        "1. If the Context contains useful information, use it to answer.\n"
+        "2. If the Context is empty or not relevant, answer using your own knowledge.\n"
+        "3. Be precise and financially accurate.\n"
+        "4. Respond in clear plain text only. Do not use markdown formatting, asterisks (*),\n"
+        "   hash symbols (#), bullet lists, or code blocks.\n"
+    )
+
+    messages = [{"role": "system", "content": system_prompt}]
+
+    if extra_system_msgs:
+        messages.extend(extra_system_msgs)
+
+    messages.append({"role": "system", "content": f"Context:\n{context_text}"})
+    messages.append({"role": "user", "content": user_msg})
+
+    return messages
+
+
 # ---------- Routes ----------
 @app.route("/")
 def home():
     # If user not authenticated, send to login page.
-    if not (hasattr(current_user, "is_authenticated") and current_user.is_authenticated):
+    if REQUIRE_AUTH and not (hasattr(current_user, "is_authenticated") and current_user.is_authenticated):
         return redirect("/login")
     return render_template("index.html", APP_VERSION=read_version())
 
@@ -512,7 +678,6 @@ def register():
     return redirect("/")
 
 
-
 @app.route("/test_search")
 def test_search():
     if not search_client:
@@ -551,11 +716,15 @@ def chat():
         ):
             return jsonify({"error": "Authentication required"}), 401
 
+    if client is None:
+        return jsonify({"error": "LLM backend not configured"}), 500
+
     payload = request.get_json(silent=True) or {}
     user_msg = (payload.get("message") or "").strip()
     if not user_msg:
         return jsonify({"error": "Empty message"}), 400
 
+    # Ensure history + sections + current_topic exist in Flask session
     if "history" not in session:
         session["history"] = [
             {
@@ -563,45 +732,62 @@ def chat():
                 "content": "I’m SageAlpha, a financial assistant powered by SageAlpha.ai to support your financial decisions.",
             }
         ]
+    if "sections" not in session:
+        session["sections"] = []
+    if "current_topic" not in session:
+        session["current_topic"] = ""
+
     history = session["history"]
+    sections = session["sections"]
+    last_topic = session.get("current_topic", "")
+
+    # Update topic based on this user message
+    current_topic = extract_topic(user_msg, last_topic)
+    session["current_topic"] = current_topic or ""
+
     history.append({"role": "user", "content": user_msg})
+
+    # Build session memory filtered by current topic
+    session_memory_text = build_session_memory_sections(sections, current_topic)
+    extra_system_msgs = []
+    if session_memory_text:
+        extra_system_msgs.append(
+            {
+                "role": "system",
+                "content": f"Session memory (previous Q&A sections):\n{session_memory_text}",
+            }
+        )
 
     top_k = int(payload.get("top_k", 5))
     retrieved = search_azure(user_msg, top_k)
     if not retrieved and search_client is None:
         retrieved = vs.search(user_msg, k=top_k)
 
-    context_chunks = [
-        f"Source: {r['meta'].get('source', r.get('doc_id'))}\n{r['text']}\n"
-        for r in retrieved
-    ]
-    context_text = "\n\n".join(context_chunks)[:6000]
+    messages = build_hybrid_messages(user_msg, retrieved, extra_system_msgs=extra_system_msgs)
 
-    system_prompt = (
-        "I’m SageAlpha, a financial assistant powered by SageAlpha.ai to support your financial decisions. "
-        "Use the provided context to answer the user's question. "
-        "If context is insufficient, be honest and say so. "
-        "Respond in clear plain text only. Do not use markdown formatting, "
-        "asterisks (*), hash symbols (#), bullet lists, or code blocks."
-    )
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "system", "content": f"Context:\n{context_text}"},
-        {"role": "user", "content": user_msg},
-    ]
+    print(f"[chat] user_msg={user_msg!r}, current_topic={current_topic!r}")
 
     try:
         response = client.chat.completions.create(
-            model=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
+            model=AZURE_OPENAI_DEPLOYMENT,
             messages=messages,
             max_tokens=800,
             temperature=0.0,
             top_p=0.95,
         )
         ai_msg = response.choices[0].message.content
+
+        # Save in history + sections
         history.append({"role": "assistant", "content": ai_msg})
+        sections.append(
+            {
+                "timestamp": datetime.utcnow().isoformat(),
+                "query": user_msg,
+                "answer": ai_msg,
+            }
+        )
         session["history"] = history
+        session["sections"] = sections
 
         sources = [
             {
@@ -647,6 +833,9 @@ def chat():
 
 @app.route("/query", methods=["POST"])
 def query():
+    if client is None:
+        return jsonify({"error": "LLM backend not configured"}), 500
+
     payload = request.get_json(silent=True) or {}
     q = (payload.get("q") or "").strip()
     if not q:
@@ -661,7 +850,7 @@ def query():
 
     for r in results:
         att = r.get("meta", {}).get("attachment") or ""
-        if not fetch_pdf or not att:
+        if not fetch_pdf or not att or not blob_reader:
             continue
         try:
             if att.startswith("https://"):
@@ -685,20 +874,9 @@ def query():
     else:
         final_results = vs.search(q, k=top_k)
 
-    context_chunks = [
-        f"Source: {r['meta'].get('source', r['doc_id'])}\n{r['text']}"
-        for r in final_results
-    ]
-    context_text = "\n\n".join(context_chunks)[:6000]
+    messages = build_hybrid_messages(q, final_results)
 
-    messages = [
-        {
-            "role": "system",
-            "content": "I’m SageAlpha, a financial assistant using smart financial models to guide your decisions.",
-        },
-        {"role": "system", "content": f"Context:\n{context_text}"},
-        {"role": "user", "content": q},
-    ]
+    print(f"[query] q={q!r}")
 
     try:
         resp = client.chat.completions.create(
@@ -847,6 +1025,12 @@ def report_html():
 
 @app.route("/refresh", methods=["POST"])
 def refresh():
+    if REQUIRE_AUTH:
+        if not (
+            (hasattr(current_user, "is_authenticated") and current_user.is_authenticated)
+            or session.get("user")
+        ):
+            return jsonify({"error": "Authentication required"}), 401
     try:
         startup_index()
         return jsonify({"status": "refreshed"})
@@ -856,7 +1040,15 @@ def refresh():
 
 @app.route("/reset_history", methods=["POST"])
 def reset_history():
+    if REQUIRE_AUTH:
+        if not (
+            (hasattr(current_user, "is_authenticated") and current_user.is_authenticated)
+            or session.get("user")
+        ):
+            return jsonify({"error": "Authentication required"}), 401
     session.pop("history", None)
+    session.pop("sections", None)
+    session.pop("current_topic", None)
     return jsonify({"status": "cleared"})
 
 
@@ -871,6 +1063,10 @@ def handle_exception(e):
 
 @app.route("/user", methods=["GET"])
 def user():
+    if REQUIRE_AUTH and not (hasattr(current_user, "is_authenticated") and current_user.is_authenticated):
+        return jsonify(
+            {"username": "Guest", "email": "guest@gmail.com", "avatar_url": None}
+        )
     if hasattr(current_user, "is_authenticated") and current_user.is_authenticated:
         return jsonify(
             {
@@ -886,19 +1082,19 @@ def user():
 
 @app.route("/sessions", methods=["GET"])
 def list_sessions():
+    if REQUIRE_AUTH:
+        if not (
+            hasattr(current_user, "is_authenticated")
+            and current_user.is_authenticated
+        ):
+            return jsonify({"error": "Authentication required"}), 401
     out = []
     sessions_sorted = sorted(
         SESSIONS.values(), key=lambda x: x["created"], reverse=True
     )
     for s in sessions_sorted:
-        if REQUIRE_AUTH:
-            if not (
-                hasattr(current_user, "is_authenticated")
-                and current_user.is_authenticated
-            ):
-                continue
-            if s.get("owner") != current_user.username:
-                continue
+        if s.get("owner") != current_user.username:
+            continue
         out.append(
             {
                 "id": s["id"],
@@ -913,46 +1109,48 @@ def list_sessions():
 
 @app.route("/sessions", methods=["POST"])
 def create_session_route():
+    if REQUIRE_AUTH:
+        if not (
+            hasattr(current_user, "is_authenticated")
+            and current_user.is_authenticated
+        ):
+            return jsonify({"error": "Authentication required"}), 401
     data = request.get_json(silent=True) or {}
     title = data.get("title") or "New chat"
-    owner = None
-    if hasattr(current_user, "is_authenticated") and current_user.is_authenticated:
-        owner = current_user.username
-    if REQUIRE_AUTH and not owner:
-        return jsonify({"error": "Authentication required"}), 401
+    owner = current_user.username
     s = create_session(title, owner=owner)
     return jsonify({"session": s}), 201
 
 
 @app.route("/sessions/<session_id>", methods=["GET"])
 def get_session(session_id):
-    s = SESSIONS.get(session_id)
-    if not s:
-        return jsonify({"error": "Session not found"}), 404
     if REQUIRE_AUTH:
         if not (
             hasattr(current_user, "is_authenticated")
             and current_user.is_authenticated
         ):
             return jsonify({"error": "Authentication required"}), 401
-        if s.get("owner") != current_user.username:
-            return jsonify({"error": "Session not found"}), 404
+    s = SESSIONS.get(session_id)
+    if not s:
+        return jsonify({"error": "Session not found"}), 404
+    if s.get("owner") != current_user.username:
+        return jsonify({"error": "Session not found"}), 404
     return jsonify({"session": s})
 
 
 @app.route("/sessions/<session_id>/rename", methods=["POST"])
 def rename_session(session_id):
-    s = SESSIONS.get(session_id)
-    if not s:
-        return jsonify({"error": "Session not found"}), 404
     if REQUIRE_AUTH:
         if not (
             hasattr(current_user, "is_authenticated")
             and current_user.is_authenticated
         ):
             return jsonify({"error": "Authentication required"}), 401
-        if s.get("owner") != current_user.username:
-            return jsonify({"error": "Session not found"}), 404
+    s = SESSIONS.get(session_id)
+    if not s:
+        return jsonify({"error": "Session not found"}), 404
+    if s.get("owner") != current_user.username:
+        return jsonify({"error": "Session not found"}), 404
     data = request.get_json(silent=True) or {}
     title = (data.get("title") or "").strip()
     if title:
@@ -962,62 +1160,56 @@ def rename_session(session_id):
 
 @app.route("/chat_session", methods=["POST"])
 def chat_session():
+    if REQUIRE_AUTH:
+        if not (
+            hasattr(current_user, "is_authenticated")
+            and current_user.is_authenticated
+        ):
+            return jsonify({"error": "Authentication required"}), 401
+
+    if client is None:
+        return jsonify({"error": "LLM backend not configured"}), 500
+
     payload = request.get_json(silent=True) or {}
     session_id = payload.get("session_id")
     user_msg = (payload.get("message") or "").strip()
     if not user_msg:
         return jsonify({"error": "Empty message"}), 400
 
+    # Ensure session exists
     if session_id and session_id in SESSIONS:
         s = SESSIONS[session_id]
-        if REQUIRE_AUTH:
-            if not (
-                hasattr(current_user, "is_authenticated")
-                and current_user.is_authenticated
-            ):
-                return jsonify({"error": "Authentication required"}), 401
-            if s.get("owner") and s.get("owner") != current_user.username:
-                return jsonify({"error": "Session not found"}), 404
+        if s.get("owner") != current_user.username:
+            return jsonify({"error": "Session not found"}), 404
     else:
-        owner = (
-            current_user.username
-            if (
-                hasattr(current_user, "is_authenticated")
-                and current_user.is_authenticated
-            )
-            else None
-        )
-        if REQUIRE_AUTH and not owner:
-            return jsonify({"error": "Authentication required"}), 401
-        s = create_session("New chat", owner=owner)
+        s = create_session("New chat", owner=current_user.username)
         session_id = s["id"]
 
     s["messages"].append({"role": "user", "content": user_msg, "meta": {}})
+
+    # Topic tracking for this multi-session
+    last_topic = s.get("current_topic", "")
+    current_topic = extract_topic(user_msg, last_topic)
+    s["current_topic"] = current_topic or ""
+
+    # Build session memory
+    session_memory_text = build_session_memory_sections(s.get("sections", []), current_topic)
+    extra_system_msgs = []
+    if session_memory_text:
+        extra_system_msgs.append(
+            {
+                "role": "system",
+                "content": f"Session memory (previous Q&A sections):\n{session_memory_text}",
+            }
+        )
 
     top_k = int(payload.get("top_k", 5))
     retrieved = search_azure(user_msg, top_k)
     if not retrieved and search_client is None:
         retrieved = vs.search(user_msg, k=top_k)
+    messages = build_hybrid_messages(user_msg, retrieved, extra_system_msgs=extra_system_msgs)
 
-    context_chunks = [
-        f"Source: {r['meta'].get('source', r.get('doc_id'))}\n{r['text']}"
-        for r in retrieved
-    ]
-    context_text = "\n\n".join(context_chunks)[:6000]
-
-    system_prompt = (
-        "I’m SageAlpha, a financial assistant using smart financial models to guide your decisions. "
-        "Use the provided context to answer the user's question. "
-        "If context is insufficient, be honest and say so. "
-        "Respond in clear plain text only. Do not use markdown formatting, asterisks (*), hash symbols (#), "
-        "bullet lists, or code blocks."
-    )
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "system", "content": f"Context:\n{context_text}"},
-        {"role": "user", "content": user_msg},
-    ]
+    print(f"[chat_session] session_id={session_id}, msg={user_msg!r}, current_topic={current_topic!r}")
 
     try:
         resp = client.chat.completions.create(
@@ -1028,7 +1220,17 @@ def chat_session():
             top_p=0.95,
         )
         ai_msg = resp.choices[0].message.content
+
         s["messages"].append({"role": "assistant", "content": ai_msg, "meta": {}})
+
+        # Store section-wise memory (Q&A pair)
+        s["sections"].append(
+            {
+                "timestamp": datetime.utcnow().isoformat(),
+                "query": user_msg,
+                "answer": ai_msg,
+            }
+        )
 
         sources = [
             {
@@ -1039,7 +1241,13 @@ def chat_session():
             for r in retrieved
         ]
 
-        return jsonify({"session_id": session_id, "response": ai_msg, "sources": sources})
+        return jsonify(
+            {
+                "session_id": session_id,
+                "response": ai_msg,
+                "sources": sources,
+            }
+        )
     except Exception as e:
         print("[chat_session][ERROR]", repr(e))
         s["messages"].append(
