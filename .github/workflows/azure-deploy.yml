@@ -1,0 +1,134 @@
+# SageAlpha.ai v3.0 - Azure App Service Deployment
+# GitHub Actions workflow for CI/CD to Azure
+
+name: Deploy to Azure App Service
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: '3.12'
+  AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME || 'sagealpha-chatbot' }}
+
+jobs:
+  # Build and Test
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install black isort flake8 mypy
+
+      - name: Format check with Black
+        run: |
+          black --check --diff . || echo "::warning::Code formatting issues found. Run 'black .' to fix."
+        continue-on-error: true
+
+      - name: Import sort check with isort
+        run: |
+          isort --check-only --diff . || echo "::warning::Import sorting issues found. Run 'isort .' to fix."
+        continue-on-error: true
+
+      - name: Lint with flake8
+        run: |
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+        continue-on-error: true
+
+      - name: Create deployment artifact
+        run: |
+          zip -r deploy.zip . \
+            -x "*.git*" \
+            -x "*__pycache__*" \
+            -x "*.pyc" \
+            -x "*venv*" \
+            -x "*env*" \
+            -x "*.env" \
+            -x "*.db" \
+            -x "*vector_store_data*" \
+            -x "*uploads*" \
+            -x "*.zip"
+
+      - name: Upload artifact for deployment
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-app
+          path: deploy.zip
+
+  # Deploy to Azure (only on push to main/master)
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    
+    environment:
+      name: 'production'
+      url: ${{ steps.deploy-to-webapp.outputs.webapp-url }}
+
+    steps:
+      - name: Download artifact from build job
+        uses: actions/download-artifact@v4
+        with:
+          name: python-app
+
+      - name: Unzip artifact
+        run: unzip deploy.zip -d ./app
+
+      - name: Deploy to Azure Web App
+        id: deploy-to-webapp
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+          package: ./app
+
+      - name: Post-deployment health check
+        run: |
+          echo "Waiting for deployment to stabilize..."
+          sleep 30
+          HEALTH_URL="${{ steps.deploy-to-webapp.outputs.webapp-url }}"
+          echo "Checking health at: $HEALTH_URL"
+          curl -sSf "$HEALTH_URL" || echo "::warning::Health check failed, app may still be starting"
+        continue-on-error: true
+
+  # Staging deployment (for PRs)
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'pull_request'
+    
+    environment:
+      name: 'staging'
+
+    steps:
+      - name: Download artifact from build job
+        uses: actions/download-artifact@v4
+        with:
+          name: python-app
+
+      - name: Staging deployment info
+        run: |
+          echo "This is a PR build. Staging deployment can be configured here."
+          echo "PR: #${{ github.event.pull_request.number }}"
+          echo "Title: ${{ github.event.pull_request.title }}"
+

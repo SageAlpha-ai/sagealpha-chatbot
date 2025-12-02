@@ -1,59 +1,311 @@
-import os
+"""
+SageAlpha.ai v3.0 - 2025 Flask Application
+Modern Flask 3.x with Blueprints, SocketIO, and async support
+"""
+
 import io
-import json
-import tempfile
+import os
+import re
 from datetime import datetime
+from functools import wraps
 from uuid import uuid4
 
-from flask import (
-    Flask, request, session, render_template, make_response, jsonify,
-    redirect, url_for, send_from_directory
-)
-from werkzeug.utils import secure_filename
-from werkzeug.security import generate_password_hash
-from dotenv import load_dotenv
 import pandas as pd
-from functools import wraps
-
-from openai import AzureOpenAI
+from dotenv import load_dotenv
+from flask import (
+    Flask,
+    jsonify,
+    make_response,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
+from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_login import LoginManager, current_user
+from flask_socketio import SocketIO, emit, join_room
+from werkzeug.exceptions import HTTPException
+from werkzeug.security import generate_password_hash
+from werkzeug.utils import secure_filename
 
 from blob_utils import BlobReader
+from blueprints import auth_bp, chat_bp, pdf_bp
+from blueprints.chat import (
+    SESSIONS,
+    build_session_memory_sections,
+    create_session,
+    extract_topic,
+)
+from db_migrate import run_migrations
 from extractor import extract_text_from_pdf_bytes, parse_xbrl_file_to_text
+from models import Message, User, db
 from vector_store import VectorStore
-import re
 
-from azure.search.documents import SearchClient
-from azure.core.credentials import AzureKeyCredential
-from werkzeug.exceptions import HTTPException
-
-from flask_login import login_user, logout_user, current_user, LoginManager
-from models import db, User, Message
-from auth import auth as auth_bp  # your auth blueprint (kept)
-
+# Load environment variables
 load_dotenv()
 
-AZURE_BLOB_CONNECTION_STRING = os.getenv("AZURE_BLOB_CONNECTION_STRING")
+# ==================== Environment Detection ====================
+IS_PRODUCTION = os.getenv("WEBSITE_SITE_NAME") is not None
+IS_AZURE = IS_PRODUCTION  # Alias for clarity
+
+# ==================== Configuration ====================
+# Flask
+FLASK_SECRET = os.getenv("FLASK_SECRET") or os.urandom(24).hex()
+REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "true").lower() in ("1", "true", "yes")
+
+# Database - Support both SQLite (local) and PostgreSQL (production)
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Azure Blob Storage
+AZURE_BLOB_CONNECTION_STRING = os.getenv("AZURE_BLOB_CONNECTION_STRING") or os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+
+# Azure OpenAI - Only initialize if credentials present
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
-AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
-FLASK_SECRET = os.getenv("FLASK_SECRET") or os.urandom(24).hex()
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
 
-REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "true").lower() in ("1", "true", "yes")
-
-# Azure Cognitive Search config
+# Azure Cognitive Search
 AZURE_SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT")
 AZURE_SEARCH_KEY = os.getenv("AZURE_SEARCH_KEY")
 AZURE_SEARCH_INDEX = os.getenv("AZURE_SEARCH_INDEX", "azureblob-index")
-AZURE_SEARCH_SEMANTIC_CONFIG = os.getenv("AZURE_SEARCH_SEMANTIC_CONFIG")  # e.g. "default"
+AZURE_SEARCH_SEMANTIC_CONFIG = os.getenv("AZURE_SEARCH_SEMANTIC_CONFIG")
 
-if not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_API_KEY or not AZURE_OPENAI_DEPLOYMENT:
-    print("[WARN] Missing Azure OpenAI configuration – chat may not work correctly.")
+# Redis/Celery - For background tasks
+REDIS_URL = os.getenv("AZURE_REDIS_CONNECTION_STRING") or os.getenv("REDIS_URL") or "redis://localhost:6379/0"
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL") or REDIS_URL
 
-if not AZURE_SEARCH_ENDPOINT or not AZURE_SEARCH_KEY or not AZURE_SEARCH_INDEX:
-    print("[WARN] Missing Azure Search configuration – RAG search will be disabled.")
+# ==================== Lazy Azure Client Initialization ====================
+_openai_client = None
+_search_client = None
 
-# Azure Cognitive Search client
+
+def get_openai_client():
+    """Lazily initialize Azure OpenAI client only when needed."""
+    global _openai_client
+    if _openai_client is None and AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY:
+        from openai import AzureOpenAI
+        _openai_client = AzureOpenAI(
+            azure_endpoint=AZURE_OPENAI_ENDPOINT,
+            api_key=AZURE_OPENAI_API_KEY,
+            api_version=AZURE_OPENAI_API_VERSION,
+        )
+    return _openai_client
+
+
+def get_search_client():
+    """Lazily initialize Azure Search client only when needed."""
+    global _search_client
+    if _search_client is None and AZURE_SEARCH_ENDPOINT and AZURE_SEARCH_KEY:
+        from azure.core.credentials import AzureKeyCredential
+        from azure.search.documents import SearchClient
+        _search_client = SearchClient(
+            endpoint=AZURE_SEARCH_ENDPOINT,
+            index_name=AZURE_SEARCH_INDEX,
+            credential=AzureKeyCredential(AZURE_SEARCH_KEY),
+        )
+    return _search_client
+
+
+def create_app(config_name: str = "default") -> Flask:
+    """Application factory for Flask app."""
+    app = Flask(__name__, static_folder="static", template_folder="templates")
+    app.secret_key = FLASK_SECRET
+
+    # ==================== Database Configuration ====================
+    # Priority: DATABASE_URL env var > Azure path > local SQLite
+    db_path = None  # Only used for SQLite
+    
+    if DATABASE_URL:
+        # Production PostgreSQL (or other DB via DATABASE_URL)
+        db_uri = DATABASE_URL
+        # Fix Heroku-style postgres:// -> postgresql://
+        if db_uri.startswith("postgres://"):
+            db_uri = db_uri.replace("postgres://", "postgresql://", 1)
+        print(f"[startup] Using DATABASE_URL: {db_uri.split('@')[-1] if '@' in db_uri else 'configured'}")
+    elif IS_PRODUCTION:
+        # Azure App Service with SQLite fallback
+        db_dir = "/home/data"
+        os.makedirs(db_dir, exist_ok=True)
+        db_path = os.path.join(db_dir, "sagealpha.db")
+        db_uri = f"sqlite:///{db_path}"
+        print(f"[startup] Using Azure SQLite: {db_path}")
+    else:
+        # Local development SQLite
+        db_dir = os.path.dirname(__file__) or "."
+        os.makedirs(db_dir, exist_ok=True)
+        db_path = os.path.join(db_dir, "sagealpha.db")
+        db_uri = f"sqlite:///{db_path}"
+        print(f"[startup] Using local SQLite: {db_path}")
+
+    app.config["SQLALCHEMY_DATABASE_URI"] = db_uri
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    
+    # Connection pool settings for production
+    if IS_PRODUCTION and DATABASE_URL:
+        app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+            "pool_pre_ping": True,
+            "pool_recycle": 300,
+            "pool_size": 10,
+            "max_overflow": 20,
+        }
+
+    # ==================== Session Configuration ====================
+    app.config["SESSION_COOKIE_SECURE"] = IS_PRODUCTION
+    app.config["SESSION_COOKIE_HTTPONLY"] = True
+    app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+    
+    # Debug mode
+    app.config["DEBUG"] = not IS_PRODUCTION
+
+    # ==================== Initialize Extensions ====================
+    db.init_app(app)
+
+    # CORS configuration
+    CORS(
+        app,
+        resources={r"/api/*": {"origins": "*"}},
+        supports_credentials=True,
+    )
+
+    # Rate limiting - use Redis in production, memory in dev
+    rate_limit_storage = REDIS_URL if IS_PRODUCTION else "memory://"
+    limiter = Limiter(
+        key_func=get_remote_address,
+        app=app,
+        default_limits=["200 per day", "50 per hour"],
+        storage_uri=rate_limit_storage,
+    )
+
+    # Login manager
+    login_manager = LoginManager()
+    login_manager.init_app(app)
+    login_manager.login_view = "auth.login"
+
+    @login_manager.user_loader
+    def load_user(user_id):
+        try:
+            return db.session.get(User, int(user_id))
+        except Exception:
+            return None
+
+    # Register blueprints
+    app.register_blueprint(auth_bp)
+    app.register_blueprint(chat_bp)
+    app.register_blueprint(pdf_bp)
+
+    # Context processor for version and environment
+    @app.context_processor
+    def inject_globals():
+        return {
+            "APP_VERSION": read_version(),
+            "IS_PRODUCTION": IS_PRODUCTION,
+        }
+
+    # ==================== Initialize Database ====================
+    with app.app_context():
+        # Run SQLite migrations only for SQLite databases
+        if db_path and os.path.exists(db_path):
+            try:
+                run_migrations(db_path)
+            except Exception as e:
+                print(f"[startup][WARN] Migration check failed: {e!r}")
+        
+        # Create any missing tables (safe with existing tables)
+        db.create_all()
+        seed_demo_users()
+
+    return app
+
+
+def read_version() -> str:
+    """Get application version."""
+    v = os.getenv("SAGEALPHA_VERSION")
+    if v:
+        return v.strip()
+    try:
+        with open(os.path.join(os.path.dirname(__file__), "VERSION"), "r") as f:
+            return f.read().strip()
+    except Exception:
+        return "3.0.0"
+
+
+def seed_demo_users():
+    """Seed demo users if they don't exist."""
+    from datetime import datetime, timezone
+    
+    print("[startup] Ensuring DB tables and demo users...")
+    try:
+        demo_users = [
+            ("demouser", "DemoUser", "DemoPass123!", "demouser@sagealpha.ai"),
+            ("devuser", "DevUser", "DevPass123!", "devuser@sagealpha.ai"),
+            ("produser", "ProductionUser", "ProdPass123!", "produser@sagealpha.ai"),
+        ]
+        created_any = False
+        updated_any = False
+        
+        for username, display, pwd, email in demo_users:
+            try:
+                existing = User.query.filter_by(username=username).first()
+            except Exception:
+                # Table might have schema issues, try raw query
+                existing = None
+            
+            if not existing:
+                u = User(
+                    username=username,
+                    display_name=display,
+                    password_hash=generate_password_hash(pwd),
+                    email=email,
+                    is_active=True,
+                )
+                db.session.add(u)
+                created_any = True
+            else:
+                # Update existing users with new fields if they're missing
+                needs_update = False
+                if not getattr(existing, "email", None):
+                    existing.email = email
+                    needs_update = True
+                if getattr(existing, "is_active", None) is None:
+                    existing.is_active = True
+                    needs_update = True
+                if needs_update:
+                    updated_any = True
+        
+        if created_any or updated_any:
+            db.session.commit()
+            if created_any:
+                print("[startup] Seeded demo users: demouser / devuser / produser")
+            if updated_any:
+                print("[startup] Updated existing demo users with new fields")
+        else:
+            print("[startup] Demo users already exist and are up to date.")
+    except Exception as e:
+        print(f"[startup][ERROR] Failed to seed demo users: {e!r}")
+        # Try to rollback any partial changes
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+
+
+# Create app instance
+app = create_app()
+
+# Initialize SocketIO for real-time chat
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode="gevent",
+    ping_timeout=60,
+    ping_interval=25,
+)
+
+# Initialize Azure services
 search_client = None
 if AZURE_SEARCH_ENDPOINT and AZURE_SEARCH_KEY and AZURE_SEARCH_INDEX:
     try:
@@ -68,97 +320,7 @@ if AZURE_SEARCH_ENDPOINT and AZURE_SEARCH_KEY and AZURE_SEARCH_INDEX:
 else:
     print("[startup] Azure Search client not initialized.")
 
-app = Flask(__name__, static_folder="static", template_folder="templates")
-app.secret_key = FLASK_SECRET
-
-if os.getenv("WEBSITE_SITE_NAME"):
-    # We are running on Azure App Service
-    DB_DIR = "/home/data"   # <── ALWAYS writable on Azure
-else:
-    # Local dev: keep DB file in the project folder
-    DB_DIR = os.path.dirname(__file__)
-
-# Ensure the directory exists
-os.makedirs(DB_DIR, exist_ok=True)
-
-db_path = os.path.join(DB_DIR, "sagealpha.db")
-app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{db_path}"
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
-# register auth blueprint
-try:
-    app.register_blueprint(auth_bp)
-except Exception as e:
-    print("[startup] auth blueprint register failed (maybe already registered):", e)
-
-# ---------------- DB + Login Manager Init ----------------
-db.init_app(app)
-login_manager = LoginManager()
-login_manager.init_app(app)
-login_manager.login_view = "login"
-
-
-def seed_demo_users():
-    """
-    Ensure database tables exist and seed demo users:
-      - demouser / DemoPass123!
-      - devuser  / DevPass123!
-      - produser / ProdPass123!
-    Only creates them if they don't already exist.
-    """
-    print("[startup] Ensuring DB tables and demo users...")
-    try:
-        db.create_all()
-        demo_users = [
-            ("demouser", "DemoUser", "DemoPass123!"),
-            ("devuser", "DevUser", "DevPass123!"),
-            ("produser", "ProductionUser", "ProdPass123!"),
-        ]
-        created_any = False
-        for username, display, pwd in demo_users:
-            existing = User.query.filter_by(username=username).first()
-            if not existing:
-                u = User(
-                    username=username,
-                    display_name=display,
-                    password_hash=generate_password_hash(pwd),
-                )
-                db.session.add(u)
-                created_any = True
-        if created_any:
-            db.session.commit()
-            print("[startup] Seeded demo users: demouser / devuser / produser")
-        else:
-            print("[startup] Demo users already exist.")
-    except Exception as e:
-        print("[startup][ERROR] Failed to seed demo users:", repr(e))
-
-
-@login_manager.user_loader
-def load_user(user_id):
-    # Keep it simple: expect integer primary keys
-    try:
-        return User.query.get(int(user_id))
-    except Exception:
-        return None
-
-
-def read_version():
-    v = os.getenv("SAGEALPHA_VERSION")
-    if v:
-        return v.strip()
-    try:
-        with open(os.path.join(os.path.dirname(__file__), "VERSION"), "r") as f:
-            return f.read().strip()
-    except Exception:
-        return "0.0.0"
-
-
-@app.context_processor
-def inject_version():
-    return {"APP_VERSION": read_version()}
-
-# ---------- Azure OpenAI client (safe init) ----------
+# Azure OpenAI client
 client = None
 if AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY:
     try:
@@ -169,124 +331,39 @@ if AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY:
         )
         print("[startup] AzureOpenAI client initialized.")
     except Exception as e:
-        client = None
-        print("[startup][WARN] Failed to initialize AzureOpenAI client:", repr(e))
+        print(f"[startup][WARN] Failed to initialize AzureOpenAI client: {e!r}")
 else:
-    print("[startup][WARN] Azure OpenAI configuration incomplete – LLM calls will be disabled.")
+    print("[startup][WARN] Azure OpenAI configuration incomplete.")
 
-# ---------- BlobReader (safe init) ----------
+# BlobReader
 BLOB_CONTAINER = "nse-data-raw"
 blob_reader = None
 if AZURE_BLOB_CONNECTION_STRING:
     try:
-        blob_reader = BlobReader(conn_str=AZURE_BLOB_CONNECTION_STRING, container=BLOB_CONTAINER)
+        blob_reader = BlobReader(
+            conn_str=AZURE_BLOB_CONNECTION_STRING, container=BLOB_CONTAINER
+        )
         print("[startup] BlobReader initialized.")
     except Exception as e:
-        blob_reader = None
-        print("[startup][WARN] Failed to initialize BlobReader:", repr(e))
+        print(f"[startup][WARN] Failed to initialize BlobReader: {e!r}")
 else:
-    print("[WARN] Missing AZURE_BLOB_CONNECTION_STRING – blob features disabled.")
+    print("[WARN] Missing AZURE_BLOB_CONNECTION_STRING.")
 
+# Vector store
 VECTOR_STORE_DIR = "vector_store_data"
 os.makedirs(VECTOR_STORE_DIR, exist_ok=True)
 vs = VectorStore(store_dir=VECTOR_STORE_DIR)
 
-INDEX_ON_STARTUP = os.getenv("INDEX_ON_STARTUP", "false").lower() == "true"
-
-
-def startup_index():
-    if not blob_reader:
-        print("[startup] BlobReader not initialized; skipping indexing.")
-        return
-
-    print("[startup] Listing metadata CSVs...")
-    csv_prefix = "metadata/"
-    csv_blobs = blob_reader.list_blobs(prefix=csv_prefix)
-    total_rows = 0
-
-    for b in csv_blobs:
-        if not b.name.lower().endswith(".csv"):
-            continue
-        print(f"[startup] Loading CSV: {b.name}")
-        data = blob_reader.download_blob_to_bytes(b.name)
-        df = pd.read_csv(io.BytesIO(data))
-
-        for idx, row in df.iterrows():
-            symbol = str(row.get("symbol", "") or "")
-            desc = str(row.get("desc", "") or "")
-            attfile = str(row.get("attchmntFile", "") or "")
-            an_dt = str(row.get("an_dt", "") or row.get("dt", ""))
-            doc_text = (
-                f"Symbol: {symbol}\nDate: {an_dt}\nDescription: {desc}\nAttachment: {attfile}"
-            )
-            meta = {
-                "source": f"csv:{b.name}",
-                "symbol": symbol,
-                "csv_row_index": int(idx),
-                "attachment": attfile,
-                "timestamp": an_dt,
-            }
-            vs.add_document(
-                doc_id=f"csv::{b.name}::row::{idx}",
-                text=doc_text,
-                meta=meta,
-            )
-            total_rows += 1
-
-    xbrl_prefix = "cupid_data/"
-    xbrl_blobs = blob_reader.list_blobs(prefix=xbrl_prefix)
-
-    for b in xbrl_blobs:
-        if not (b.name.lower().endswith(".xml") or b.name.lower().endswith(".xbrl")):
-            continue
-        print(f"[startup] Parsing XBRL: {b.name}")
-        data = blob_reader.download_blob_to_bytes(b.name)
-        try:
-            text = parse_xbrl_file_to_text(data)
-            meta = {"source": f"xbrl:{b.name}", "symbol": "CUPID"}
-            vs.add_document(doc_id=f"xbrl::{b.name}", text=text, meta=meta)
-        except Exception as e:
-            print(f"[startup] Failed parse {b.name}: {e}")
-
-    print(f"[startup] Completed indexing metadata rows: {total_rows}")
-    vs.save_index()
-
-
-if INDEX_ON_STARTUP:
-    print("[startup] INDEX_ON_STARTUP=true — starting indexing...")
-    try:
-        startup_index()
-    except Exception as e:
-        print("[startup] indexing failed:", e)
-    print("[startup] Indexing completed.")
-else:
-    print("[startup] Skipped indexing on startup (INDEX_ON_STARTUP=false).")
-
-# ---- Simple in-memory session store for chat.js ----
-SESSIONS = {}  # session_id -> {id, title, created, messages: [{role, content, meta}], sections, current_topic}
-
-
-def create_session(title="New chat", owner=None):
-    sid = str(uuid4())
-    now = datetime.utcnow().isoformat()
-    SESSIONS[sid] = {
-        "id": sid,
-        "title": title or "New chat",
-        "created": now,
-        "owner": owner,
-        "messages": [],
-        "sections": [],      # section-wise Q&A memory
-        "current_topic": "", # current company/topic for this session
-    }
-    return SESSIONS[sid]
-
-
-# Directory for uploaded files
+# Upload directory
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# ---------- Helpers ----------
+
+# ==================== Helper Functions ====================
+
+
 def strip_markdown(text: str) -> str:
+    """Remove markdown formatting from text."""
     if not text:
         return text
     text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
@@ -301,90 +378,23 @@ def strip_markdown(text: str) -> str:
     return text.strip()
 
 
-def extract_topic(user_msg: str, last_topic: str | None = None) -> str | None:
-    """
-    Very simple topic extractor.
-
-    Goal:
-      - When user types 'cupid limited' or 'tata motors' → treat that as a new topic.
-      - When user types 'give owner name' or 'who is the owner' → keep using last topic.
-    """
-    if not user_msg:
-        return last_topic
-
-    text = user_msg.strip().lower()
-    tokens = re.findall(r"[a-z0-9]+", text)
-    if not tokens:
-        return last_topic
-
-    # Generic question-style prompts – don't change topic
-    question_starts = {
-        "who",
-        "what",
-        "which",
-        "when",
-        "where",
-        "why",
-        "how",
-        "give",
-        "tell",
-        "show",
-        "explain",
-        "owner",
-        "ceo",
-        "chairman",
-        "md",
-        "director",
-    }
-    if tokens[0] in question_starts:
-        return last_topic
-
-    # Short phrase (1–4 words) that is not just a generic question → assume new topic
-    if len(tokens) <= 4:
-        return text
-
-    # For longer sentences, keep the last topic (LLM + search will still see full question)
-    return last_topic
-
-
-def search_azure(query_text: str, top_k: int = 5):
-    """
-    Search Azure Cognitive Search index and return docs in unified shape:
-    [
-      {
-        "doc_id": str,
-        "text": str,
-        "meta": {...},
-        "score": float
-      },
-      ...
-    ]
-    Uses semantic search if AZURE_SEARCH_SEMANTIC_CONFIG is set.
-    """
-    if not search_client:
-        print("[azure] search_client is None. Check AZURE_SEARCH_* env vars.")
-        return []
-    if not query_text:
-        print("[azure] Empty query_text.")
+def search_azure(query_text: str, top_k: int = 5) -> list:
+    """Search Azure Cognitive Search index."""
+    if not search_client or not query_text:
         return []
 
-    print(f"[azure] Searching index '{AZURE_SEARCH_INDEX}' for query: {query_text!r}")
-
-    search_kwargs = {
-        "search_text": query_text,
-        "top": top_k,
-    }
+    search_kwargs = {"search_text": query_text, "top": top_k}
 
     if AZURE_SEARCH_SEMANTIC_CONFIG:
         search_kwargs["query_type"] = "semantic"
         search_kwargs["semantic_configuration_name"] = AZURE_SEARCH_SEMANTIC_CONFIG
-        print(f"[azure] Using semantic configuration: {AZURE_SEARCH_SEMANTIC_CONFIG}")
 
     try:
         results = search_client.search(**search_kwargs)
     except Exception as e:
         print(f"[azure] search error: {e}")
         return []
+
     output = []
     for r in results:
         content_parts = []
@@ -404,65 +414,18 @@ def search_azure(query_text: str, top_k: int = 5):
         doc_id = r.get("id") or r.get("metadata_storage_path") or ""
         score = float(r.get("@search.score", 0.0))
         output.append({"doc_id": doc_id, "text": text, "meta": meta, "score": score})
-    print(f"[azure] Retrieved {len(output)} docs from Azure Search.")
-    for i, o in enumerate(output):
-        print(
-            f"  [azure] {i+1}. doc_id={o['doc_id']!r} "
-            f"score={o['score']:.4f} source={o['meta'].get('source')!r}"
-        )
+
     return output
 
 
-def build_session_memory_sections(sections, current_topic: str | None,
-                                  limit: int = 5, max_chars: int = 1500):
-    """
-    Build a compact 'session memory' string from previous Q&A sections.
-
-    If current_topic is set:
-      - Prefer only those Q&A where this topic appears in query or answer.
-      - This prevents mixing 'Cupid Limited' memory into 'Tata Motors' queries.
-
-    If no topic or nothing matches:
-      - Fall back to last N sections of the chat.
-    """
-    if not sections:
-        return ""
-
-    normalized_topic = (current_topic or "").lower().strip()
-
-    filtered = []
-    if normalized_topic:
-        for s in sections:
-            q = (s.get("query") or "").lower()
-            a = (s.get("answer") or "").lower()
-            if normalized_topic in q or normalized_topic in a:
-                filtered.append(s)
-
-    if not filtered:
-        # No topic match → use last N overall
-        filtered = sections[-limit:]
-    else:
-        filtered = filtered[-limit:]
-
-    parts = []
-    for s in filtered:
-        parts.append(
-            f"[{s.get('timestamp','')}] Q: {s.get('query','')}\nA: {s.get('answer','')}"
-        )
-
-    memory_text = "\n\n".join(parts)
-    return memory_text[:max_chars]
-
-
-def build_hybrid_messages(user_msg: str, retrieved_docs, extra_system_msgs=None):
-    """
-    Build messages for hybrid RAG:
-    - If there are relevant search results (score above threshold),
-      include them as Context.
-    - If not, leave Context empty and let the LLM answer from its own knowledge.
-    """
+def build_hybrid_messages(
+    user_msg: str, retrieved_docs: list, extra_system_msgs: list | None = None
+) -> list:
+    """Build messages for hybrid RAG."""
     relevance_threshold = 0.35
-    relevant_docs = [r for r in retrieved_docs if r.get("score", 0.0) >= relevance_threshold]
+    relevant_docs = [
+        r for r in retrieved_docs if r.get("score", 0.0) >= relevance_threshold
+    ]
 
     if relevant_docs:
         context_chunks = [
@@ -471,10 +434,8 @@ def build_hybrid_messages(user_msg: str, retrieved_docs, extra_system_msgs=None)
             if r.get("text")
         ]
         context_text = "\n\n".join(context_chunks)[:6000]
-        print("[hybrid] Using RAG mode with context_length:", len(context_text))
     else:
         context_text = ""
-        print("[hybrid] No relevant docs found – using pure LLM mode.")
 
     system_prompt = (
         "You are SageAlpha, a financial assistant powered by SageAlpha.ai.\n"
@@ -482,8 +443,7 @@ def build_hybrid_messages(user_msg: str, retrieved_docs, extra_system_msgs=None)
         "1. If the Context contains useful information, use it to answer.\n"
         "2. If the Context is empty or not relevant, answer using your own knowledge.\n"
         "3. Be precise and financially accurate.\n"
-        "4. Respond in clear plain text only. Do not use markdown formatting, asterisks (*),\n"
-        "   hash symbols (#), bullet lists, or code blocks.\n"
+        "4. Respond in clear plain text only. Do not use markdown formatting.\n"
     )
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -497,221 +457,28 @@ def build_hybrid_messages(user_msg: str, retrieved_docs, extra_system_msgs=None)
     return messages
 
 
-# ---------- Routes ----------
+# ==================== Routes ====================
+
+
 @app.route("/")
 def home():
-    # If user not authenticated, send to login page.
-    if REQUIRE_AUTH and not (hasattr(current_user, "is_authenticated") and current_user.is_authenticated):
+    """Main chat page."""
+    if REQUIRE_AUTH and not (
+        hasattr(current_user, "is_authenticated") and current_user.is_authenticated
+    ):
         return redirect("/login")
     return render_template("index.html", APP_VERSION=read_version())
 
 
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    """
-    Render login page (GET), accept form POST (username/password) and sign the user in.
-    Accepts demo accounts demouser/devuser/produser for local and Azure testing.
-    """
-    # if already logged-in via flask-login, redirect to home
-    if hasattr(current_user, "is_authenticated") and current_user.is_authenticated:
-        return redirect("/")
-
-    # GET -> render template
-    if request.method == "GET":
-        return render_template("login.html", APP_VERSION=read_version())
-
-    # POST -> process form-encoded submission
-    username = (request.form.get("username") or "").strip()
-    password = request.form.get("password") or ""
-
-    if not username or not password:
-        # re-render with error banner
-        return (
-            render_template(
-                "login.html",
-                error="Username and password required.",
-                username=username,
-            ),
-            400,
-        )
-
-    # Try DB lookup (if models.User present)
-    user = None
-    try:
-        user = User.query.filter_by(username=username).first()
-    except Exception as e:
-        print("[login][ERROR] DB lookup failed:", repr(e))
-        user = None
-
-    authenticated = False
-    if user:
-        if hasattr(user, "check_password") and callable(getattr(user, "check_password")):
-            try:
-                authenticated = user.check_password(password)
-            except Exception:
-                authenticated = False
-        else:
-            # dev fallback: plaintext password (only for local testing)
-            try:
-                if getattr(user, "password", None) == password:
-                    authenticated = True
-            except Exception:
-                authenticated = False
-
-    # Allow demo accounts as fallback (if DB missing or user not found)
-    if not authenticated and username in ("demouser", "devuser", "produser"):
-        authenticated = True
-        if not user:
-            # create simple temporary user object compatible with flask-login
-            class _TempUser:
-                def __init__(self, username):
-                    self.id = username
-                    self.username = username
-                    self.is_active = True
-                    self.is_authenticated = True
-                    self.is_anonymous = False
-
-                def get_id(self):
-                    return str(self.id)
-
-            user = _TempUser(username)
-
-    if not authenticated:
-        return (
-            render_template(
-                "login.html",
-                error="Invalid username or password.",
-                username=username,
-            ),
-            401,
-        )
-
-    # Perform login (flask-login) and redirect home
-    try:
-        login_user(user)
-    except Exception as e:
-        print("[login][WARN] login_user failed:", repr(e))
-        # fallback: set session keys
-        session["logged_in"] = True
-        session["username"] = username
-
-    return redirect("/")
-
-
-@app.route("/register", methods=["POST"])
-def register():
-    """
-    Handle new user registration from the sign-up form on login.html.
-    Creates a User in the same SQLite DB and logs them in, then redirects to home.
-    """
-    # If already logged in, just go home
-    if hasattr(current_user, "is_authenticated") and current_user.is_authenticated:
-        return redirect("/")
-
-    username = (request.form.get("username") or "").strip()
-    password = request.form.get("password") or ""
-    confirm  = request.form.get("confirm_password") or ""
-    display_name = (request.form.get("display_name") or "").strip()
-
-    # Basic validation
-    register_error = None
-    if not username or not password or not confirm:
-        register_error = "All fields are required."
-    elif password != confirm:
-        register_error = "Passwords do not match."
-    elif len(password) < 8:
-        register_error = "Password must be at least 8 characters long."
-
-    # Username uniqueness check
-    if register_error is None:
-        try:
-            existing = User.query.filter_by(username=username).first()
-            if existing:
-                register_error = "This username is already taken. Please choose another."
-        except Exception as e:
-            print("[register][ERROR] DB lookup failed:", repr(e))
-            register_error = "Unexpected error. Please try again."
-
-    if register_error:
-        # Re-render login page with the register tab open and error message
-        return (
-            render_template(
-                "login.html",
-                show_register=True,
-                register_error=register_error,
-                reg_username=username,
-                reg_display_name=display_name,
-            ),
-            400,
-        )
-
-    # Create the user
-    try:
-        user = User(
-            username=username,
-            display_name=display_name or username,
-            password_hash=generate_password_hash(password),
-        )
-        db.session.add(user)
-        db.session.commit()
-    except Exception as e:
-        print("[register][ERROR] Failed to create user:", repr(e))
-        return (
-            render_template(
-                "login.html",
-                show_register=True,
-                register_error="Could not create account. Please try again.",
-                reg_username=username,
-                reg_display_name=display_name,
-            ),
-            500,
-        )
-
-    # Log them in and redirect to chat/home
-    try:
-        login_user(user)
-    except Exception as e:
-        print("[register][WARN] login_user failed:", repr(e))
-        session["logged_in"] = True
-        session["username"] = username
-
-    return redirect("/")
-
-
-@app.route("/test_search")
-def test_search():
-    if not search_client:
-        return jsonify(
-            {
-                "status": "error",
-                "message": "search_client is None. Check AZURE_SEARCH_* env vars.",
-            }
-        )
-    q = request.args.get("q", "cupid")
-    try:
-        results = search_client.search(search_text=q, top=3)
-        items = []
-        for r in results:
-            items.append(
-                {
-                    "id": r.get("id"),
-                    "score": r.get("@search.score"),
-                    "path": r.get("metadata_storage_path"),
-                    "content_preview": (
-                        r.get("content") or r.get("merged_content") or ""
-                    )[:200],
-                }
-            )
-        return jsonify({"status": "ok", "query": q, "results": items})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
 @app.route("/chat", methods=["POST"])
 def chat():
+    """Chat endpoint for AI conversation."""
     if REQUIRE_AUTH:
         if not (
-            (hasattr(current_user, "is_authenticated") and current_user.is_authenticated)
+            (
+                hasattr(current_user, "is_authenticated")
+                and current_user.is_authenticated
+            )
             or session.get("user")
         ):
             return jsonify({"error": "Authentication required"}), 401
@@ -724,12 +491,12 @@ def chat():
     if not user_msg:
         return jsonify({"error": "Empty message"}), 400
 
-    # Ensure history + sections + current_topic exist in Flask session
+    # Session management
     if "history" not in session:
         session["history"] = [
             {
                 "role": "system",
-                "content": "I’m SageAlpha, a financial assistant powered by SageAlpha.ai to support your financial decisions.",
+                "content": "I'm SageAlpha, a financial assistant powered by SageAlpha.ai.",
             }
         ]
     if "sections" not in session:
@@ -741,13 +508,11 @@ def chat():
     sections = session["sections"]
     last_topic = session.get("current_topic", "")
 
-    # Update topic based on this user message
     current_topic = extract_topic(user_msg, last_topic)
     session["current_topic"] = current_topic or ""
 
     history.append({"role": "user", "content": user_msg})
 
-    # Build session memory filtered by current topic
     session_memory_text = build_session_memory_sections(sections, current_topic)
     extra_system_msgs = []
     if session_memory_text:
@@ -763,9 +528,7 @@ def chat():
     if not retrieved and search_client is None:
         retrieved = vs.search(user_msg, k=top_k)
 
-    messages = build_hybrid_messages(user_msg, retrieved, extra_system_msgs=extra_system_msgs)
-
-    print(f"[chat] user_msg={user_msg!r}, current_topic={current_topic!r}")
+    messages = build_hybrid_messages(user_msg, retrieved, extra_system_msgs)
 
     try:
         response = client.chat.completions.create(
@@ -777,7 +540,6 @@ def chat():
         )
         ai_msg = response.choices[0].message.content
 
-        # Save in history + sections
         history.append({"role": "assistant", "content": ai_msg})
         sections.append(
             {
@@ -812,10 +574,10 @@ def chat():
         )
 
     except Exception as e:
-        error_msg = f"Backend error: {str(e)}"
+        error_msg = f"Backend error: {e!s}"
         msg_id = str(uuid4())
         message_obj = {"id": msg_id, "role": "assistant", "content": error_msg}
-        print("[chat][ERROR]", repr(e))
+        print(f"[chat][ERROR] {e!r}")
         return (
             jsonify(
                 {
@@ -831,8 +593,99 @@ def chat():
         )
 
 
+@app.route("/chat_session", methods=["POST"])
+def chat_session():
+    """Chat endpoint with session management."""
+    if REQUIRE_AUTH:
+        if not (
+            hasattr(current_user, "is_authenticated") and current_user.is_authenticated
+        ):
+            return jsonify({"error": "Authentication required"}), 401
+
+    if client is None:
+        return jsonify({"error": "LLM backend not configured"}), 500
+
+    payload = request.get_json(silent=True) or {}
+    session_id = payload.get("session_id")
+    user_msg = (payload.get("message") or "").strip()
+    if not user_msg:
+        return jsonify({"error": "Empty message"}), 400
+
+    if session_id and session_id in SESSIONS:
+        s = SESSIONS[session_id]
+        if s.get("owner") != getattr(current_user, "username", None):
+            return jsonify({"error": "Session not found"}), 404
+    else:
+        s = create_session("New chat", owner=getattr(current_user, "username", None))
+        session_id = s["id"]
+
+    s["messages"].append({"role": "user", "content": user_msg, "meta": {}})
+
+    last_topic = s.get("current_topic", "")
+    current_topic = extract_topic(user_msg, last_topic)
+    s["current_topic"] = current_topic or ""
+
+    session_memory_text = build_session_memory_sections(
+        s.get("sections", []), current_topic
+    )
+    extra_system_msgs = []
+    if session_memory_text:
+        extra_system_msgs.append(
+            {
+                "role": "system",
+                "content": f"Session memory (previous Q&A sections):\n{session_memory_text}",
+            }
+        )
+
+    top_k = int(payload.get("top_k", 5))
+    retrieved = search_azure(user_msg, top_k)
+    if not retrieved and search_client is None:
+        retrieved = vs.search(user_msg, k=top_k)
+
+    messages = build_hybrid_messages(user_msg, retrieved, extra_system_msgs)
+
+    try:
+        resp = client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
+            messages=messages,
+            max_tokens=800,
+            temperature=0.0,
+            top_p=0.95,
+        )
+        ai_msg = resp.choices[0].message.content
+
+        s["messages"].append({"role": "assistant", "content": ai_msg, "meta": {}})
+        s["sections"].append(
+            {
+                "timestamp": datetime.utcnow().isoformat(),
+                "query": user_msg,
+                "answer": ai_msg,
+            }
+        )
+
+        sources = [
+            {
+                "doc_id": r["doc_id"],
+                "source": r["meta"].get("source"),
+                "score": float(r["score"]),
+            }
+            for r in retrieved
+        ]
+
+        return jsonify(
+            {"session_id": session_id, "response": ai_msg, "sources": sources}
+        )
+    except Exception as e:
+        print(f"[chat_session][ERROR] {e!r}")
+        s["messages"].append(
+            {"role": "assistant", "content": f"Backend error: {e}", "meta": {}}
+        )
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/query", methods=["POST"])
 def query():
+    """Query endpoint for RAG search."""
     if client is None:
         return jsonify({"error": "LLM backend not configured"}), 500
 
@@ -861,9 +714,7 @@ def query():
             meta = {"source": f"pdf_temp:{att}", "attachment": att}
             temp_doc_id = f"temp_pdf::{att}"
             try:
-                vs.add_temporary_document(
-                    doc_id=temp_doc_id, text=extracted, meta=meta
-                )
+                vs.add_temporary_document(doc_id=temp_doc_id, text=extracted, meta=meta)
             except Exception:
                 pass
         except Exception as e:
@@ -875,8 +726,6 @@ def query():
         final_results = vs.search(q, k=top_k)
 
     messages = build_hybrid_messages(q, final_results)
-
-    print(f"[query] q={q!r}")
 
     try:
         resp = client.chat.completions.create(
@@ -907,27 +756,16 @@ def query():
             vs.clear_temporary_documents()
         except Exception:
             pass
-        print("[query][ERROR]", repr(e))
+        print(f"[query][ERROR] {e!r}")
         return jsonify({"error": str(e)}), 500
 
 
-# --- REPORT HTML endpoint used by client-side PDF generator ---
 @app.route("/report-html", methods=["GET"])
 def report_html():
-    """
-    Return a fragment that contains:
-      - head style blocks (copied)
-      - link stylesheet tags (copied so iframe can load them)
-      - body inner HTML
-      - injected print CSS to ensure print colors and high-quality capture
-
-    If the request looks like an XHR/fetch (our client), return the fragment.
-    Otherwise return the full HTML for normal browsing.
-    """
+    """Return report HTML fragment for client-side PDF generation."""
     try:
         html = render_template("sagealpha_reports.html")
 
-        # Determine if caller likely wants the fragment (AJAX/fetch)
         wants_fragment = False
         if request.headers.get("X-Requested-With", "").lower() == "xmlhttprequest":
             wants_fragment = True
@@ -941,7 +779,6 @@ def report_html():
             resp.headers["Content-Type"] = "text/html; charset=utf-8"
             return resp
 
-        # Extract <head> and <body> pieces
         head_match = re.search(
             r"<head[^>]*>([\s\S]*?)</head>", html, flags=re.IGNORECASE
         )
@@ -950,60 +787,37 @@ def report_html():
         )
 
         head_html = head_match.group(1) if head_match else ""
-        body_html = body_match.group(1) if body_match else html  # fallback: entire html
+        body_html = body_match.group(1) if body_match else html
 
-        # Extract inline <style> content from head
         style_blocks = re.findall(
             r"<style[^>]*>([\s\S]*?)</style>", head_html, flags=re.IGNORECASE
         )
 
-        # Extract link rel=stylesheet tags (keep them so iframe can load external css)
         link_tags = re.findall(
             r"<link[^>]*rel=[\"']stylesheet[\"'][^>]*>",
             head_html,
             flags=re.IGNORECASE,
         )
 
-        # IMPORTANT: Inject a small print CSS to ensure colors and layout are preserved during capture
         injected_print_css = """
         <style>
-        /* Ensure print/canvas honors background colors */
         #sagealpha-report-fragment, #sagealpha-report-fragment * {
             -webkit-print-color-adjust: exact !important;
             print-color-adjust: exact !important;
             box-sizing: border-box;
         }
-        /* Make sure the main container has white background for PDF */
-        #sagealpha-report-fragment .container {
-            background: white !important;
-        }
-        /* Tweak page width for html2canvas capture */
+        #sagealpha-report-fragment .container { background: white !important; }
         #sagealpha-report-fragment { width: 1200px; max-width: 1200px; margin: 0 auto; }
-        /* Prevent interactive elements from breaking layout */
         #sagealpha-report-fragment a { color: inherit; text-decoration: none; }
         </style>
         """
 
-        # Build combined style string (concat inline styles)
         combined_styles = ""
         if style_blocks:
             combined_styles = "<style>" + "\n".join(style_blocks) + "</style>"
 
-        # Build link tags HTML (convert relative href to absolute URL so iframe can load)
-        processed_links = []
-        for lt in link_tags:
-            href_match = re.search(r'href=[\'"]([^\'"]+)[\'"]', lt)
-            if href_match:
-                href = href_match.group(1)
-                if href.startswith("/"):
-                    processed_links.append(lt)
-                else:
-                    processed_links.append(lt)
-            else:
-                processed_links.append(lt)
-        links_html = "\n".join(processed_links)
+        links_html = "\n".join(link_tags)
 
-        # Compose the fragment: styles (inline + injected), link tags, then the body content
         fragment = (
             f"<div id='sagealpha-report-fragment' style='background:white;'>\n"
             f"{injected_print_css}\n"
@@ -1019,263 +833,377 @@ def report_html():
         return resp
 
     except Exception as e:
-        print("[report-html][ERROR]", repr(e))
-        return jsonify({"error": "Failed to render report HTML: " + str(e)}), 500
+        print(f"[report-html][ERROR] {e!r}")
+        return jsonify({"error": f"Failed to render report HTML: {e!s}"}), 500
 
 
 @app.route("/refresh", methods=["POST"])
 def refresh():
+    """Refresh index endpoint."""
     if REQUIRE_AUTH:
         if not (
-            (hasattr(current_user, "is_authenticated") and current_user.is_authenticated)
+            (
+                hasattr(current_user, "is_authenticated")
+                and current_user.is_authenticated
+            )
             or session.get("user")
         ):
             return jsonify({"error": "Authentication required"}), 401
+    return jsonify({"status": "refreshed"})
+
+
+@app.route("/test_search")
+def test_search():
+    """Test Azure Search endpoint."""
+    if not search_client:
+        return jsonify(
+            {"status": "error", "message": "search_client is None."}
+        )
+    q = request.args.get("q", "cupid")
     try:
-        startup_index()
-        return jsonify({"status": "refreshed"})
+        results = search_client.search(search_text=q, top=3)
+        items = []
+        for r in results:
+            items.append(
+                {
+                    "id": r.get("id"),
+                    "score": r.get("@search.score"),
+                    "path": r.get("metadata_storage_path"),
+                    "content_preview": (
+                        r.get("content") or r.get("merged_content") or ""
+                    )[:200],
+                }
+            )
+        return jsonify({"status": "ok", "query": q, "results": items})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/reset_history", methods=["POST"])
-def reset_history():
-    if REQUIRE_AUTH:
-        if not (
-            (hasattr(current_user, "is_authenticated") and current_user.is_authenticated)
-            or session.get("user")
-        ):
-            return jsonify({"error": "Authentication required"}), 401
-    session.pop("history", None)
-    session.pop("sections", None)
-    session.pop("current_topic", None)
-    return jsonify({"status": "cleared"})
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 @app.errorhandler(Exception)
 def handle_exception(e):
+    """Global error handler."""
     code = 500
     if isinstance(e, HTTPException):
         code = e.code
-    print("[ERROR]", repr(e))
+    print(f"[ERROR] {e!r}")
     return jsonify({"error": str(e)}), code
 
 
-@app.route("/user", methods=["GET"])
-def user():
-    if REQUIRE_AUTH and not (hasattr(current_user, "is_authenticated") and current_user.is_authenticated):
-        return jsonify(
-            {"username": "Guest", "email": "guest@gmail.com", "avatar_url": None}
-        )
-    if hasattr(current_user, "is_authenticated") and current_user.is_authenticated:
-        return jsonify(
-            {
-                "username": current_user.username,
-                "email": f"{current_user.username}@local",
-                "avatar_url": None,
-            }
-        )
-    return jsonify(
-        {"username": "Guest", "email": "guest@gmail.com", "avatar_url": None}
-    )
+# ==================== File Upload ====================
+
+# Store uploaded documents per session for RAG context
+SESSION_DOCUMENTS: dict = {}  # session_id -> [{"doc_id": str, "filename": str, "text": str}]
 
 
-@app.route("/sessions", methods=["GET"])
-def list_sessions():
+def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> list:
+    """Split text into overlapping chunks for better retrieval."""
+    if not text:
+        return []
+    
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end]
+        if chunk.strip():
+            chunks.append(chunk.strip())
+        start = end - overlap
+        if start < 0:
+            start = 0
+        if end >= len(text):
+            break
+    return chunks
+
+
+@app.route("/upload", methods=["POST"])
+def upload_file():
+    """
+    Handle PDF file upload, extract text, and index for RAG.
+    Works in both local mode and with Azure services.
+    """
     if REQUIRE_AUTH:
         if not (
-            hasattr(current_user, "is_authenticated")
-            and current_user.is_authenticated
-        ):
-            return jsonify({"error": "Authentication required"}), 401
-    out = []
-    sessions_sorted = sorted(
-        SESSIONS.values(), key=lambda x: x["created"], reverse=True
-    )
-    for s in sessions_sorted:
-        if s.get("owner") != current_user.username:
-            continue
-        out.append(
-            {
-                "id": s["id"],
-                "title": s["title"],
-                "created": s["created"],
-                "owner": s.get("owner"),
-                "message_count": len(s.get("messages", [])),
-            }
-        )
-    return jsonify({"sessions": out})
-
-
-@app.route("/sessions", methods=["POST"])
-def create_session_route():
-    if REQUIRE_AUTH:
-        if not (
-            hasattr(current_user, "is_authenticated")
-            and current_user.is_authenticated
-        ):
-            return jsonify({"error": "Authentication required"}), 401
-    data = request.get_json(silent=True) or {}
-    title = data.get("title") or "New chat"
-    owner = current_user.username
-    s = create_session(title, owner=owner)
-    return jsonify({"session": s}), 201
-
-
-@app.route("/sessions/<session_id>", methods=["GET"])
-def get_session(session_id):
-    if REQUIRE_AUTH:
-        if not (
-            hasattr(current_user, "is_authenticated")
-            and current_user.is_authenticated
-        ):
-            return jsonify({"error": "Authentication required"}), 401
-    s = SESSIONS.get(session_id)
-    if not s:
-        return jsonify({"error": "Session not found"}), 404
-    if s.get("owner") != current_user.username:
-        return jsonify({"error": "Session not found"}), 404
-    return jsonify({"session": s})
-
-
-@app.route("/sessions/<session_id>/rename", methods=["POST"])
-def rename_session(session_id):
-    if REQUIRE_AUTH:
-        if not (
-            hasattr(current_user, "is_authenticated")
-            and current_user.is_authenticated
-        ):
-            return jsonify({"error": "Authentication required"}), 401
-    s = SESSIONS.get(session_id)
-    if not s:
-        return jsonify({"error": "Session not found"}), 404
-    if s.get("owner") != current_user.username:
-        return jsonify({"error": "Session not found"}), 404
-    data = request.get_json(silent=True) or {}
-    title = (data.get("title") or "").strip()
-    if title:
-        s["title"] = title
-    return jsonify({"session": s})
-
-
-@app.route("/chat_session", methods=["POST"])
-def chat_session():
-    if REQUIRE_AUTH:
-        if not (
-            hasattr(current_user, "is_authenticated")
-            and current_user.is_authenticated
+            (hasattr(current_user, "is_authenticated") and current_user.is_authenticated)
+            or session.get("user")
         ):
             return jsonify({"error": "Authentication required"}), 401
 
-    if client is None:
-        return jsonify({"error": "LLM backend not configured"}), 500
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
 
-    payload = request.get_json(silent=True) or {}
-    session_id = payload.get("session_id")
-    user_msg = (payload.get("message") or "").strip()
-    if not user_msg:
-        return jsonify({"error": "Empty message"}), 400
+    file = request.files["file"]
+    if not file.filename:
+        return jsonify({"error": "No file selected"}), 400
 
-    # Ensure session exists
-    if session_id and session_id in SESSIONS:
-        s = SESSIONS[session_id]
-        if s.get("owner") != current_user.username:
-            return jsonify({"error": "Session not found"}), 404
-    else:
-        s = create_session("New chat", owner=current_user.username)
-        session_id = s["id"]
+    filename = secure_filename(file.filename)
+    session_id = request.form.get("session_id") or str(uuid4())
 
-    s["messages"].append({"role": "user", "content": user_msg, "meta": {}})
-
-    # Topic tracking for this multi-session
-    last_topic = s.get("current_topic", "")
-    current_topic = extract_topic(user_msg, last_topic)
-    s["current_topic"] = current_topic or ""
-
-    # Build session memory
-    session_memory_text = build_session_memory_sections(s.get("sections", []), current_topic)
-    extra_system_msgs = []
-    if session_memory_text:
-        extra_system_msgs.append(
-            {
-                "role": "system",
-                "content": f"Session memory (previous Q&A sections):\n{session_memory_text}",
-            }
-        )
-
-    top_k = int(payload.get("top_k", 5))
-    retrieved = search_azure(user_msg, top_k)
-    if not retrieved and search_client is None:
-        retrieved = vs.search(user_msg, k=top_k)
-    messages = build_hybrid_messages(user_msg, retrieved, extra_system_msgs=extra_system_msgs)
-
-    print(f"[chat_session] session_id={session_id}, msg={user_msg!r}, current_topic={current_topic!r}")
+    # Check file type
+    allowed_extensions = {".pdf", ".txt", ".md", ".csv"}
+    file_ext = os.path.splitext(filename)[1].lower()
+    if file_ext not in allowed_extensions:
+        return jsonify({"error": f"File type {file_ext} not supported. Use: {', '.join(allowed_extensions)}"}), 400
 
     try:
-        resp = client.chat.completions.create(
+        # Read file content
+        file_bytes = file.read()
+        file_size = len(file_bytes)
+
+        # Save file locally
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        saved_filename = f"{timestamp}_{filename}"
+        file_path = os.path.join(UPLOAD_DIR, saved_filename)
+        
+        with open(file_path, "wb") as f:
+            f.write(file_bytes)
+
+        print(f"[upload] Saved file: {file_path} ({file_size} bytes)")
+
+        # Extract text based on file type
+        extracted_text = ""
+        if file_ext == ".pdf":
+            from extractor import extract_text_from_pdf_bytes
+            extracted_text = extract_text_from_pdf_bytes(file_bytes)
+        elif file_ext in {".txt", ".md"}:
+            extracted_text = file_bytes.decode("utf-8", errors="ignore")
+        elif file_ext == ".csv":
+            import pandas as pd
+            df = pd.read_csv(io.BytesIO(file_bytes))
+            extracted_text = df.to_string()
+
+        if not extracted_text.strip():
+            return jsonify({"error": "Could not extract text from file"}), 400
+
+        print(f"[upload] Extracted {len(extracted_text)} characters from {filename}")
+
+        # Chunk the text for better retrieval
+        chunks = chunk_text(extracted_text, chunk_size=1500, overlap=200)
+        print(f"[upload] Created {len(chunks)} chunks")
+
+        # Generate unique document ID
+        doc_id = f"upload_{session_id}_{timestamp}_{filename}"
+
+        # Index chunks in vector store
+        for i, chunk in enumerate(chunks):
+            chunk_id = f"{doc_id}_chunk_{i}"
+            meta = {
+                "source": f"upload:{filename}",
+                "filename": filename,
+                "session_id": session_id,
+                "chunk_index": i,
+                "total_chunks": len(chunks),
+            }
+            try:
+                vs.add_document(doc_id=chunk_id, text=chunk, meta=meta)
+            except Exception as e:
+                print(f"[upload] Failed to index chunk {i}: {e}")
+
+        # Store document info for session
+        if session_id not in SESSION_DOCUMENTS:
+            SESSION_DOCUMENTS[session_id] = []
+        
+        SESSION_DOCUMENTS[session_id].append({
+            "doc_id": doc_id,
+            "filename": filename,
+            "file_path": file_path,
+            "text_preview": extracted_text[:500],
+            "chunk_count": len(chunks),
+            "uploaded_at": datetime.utcnow().isoformat(),
+        })
+
+        # Save vector store
+        vs.save_index()
+
+        return jsonify({
+            "success": True,
+            "filename": filename,
+            "doc_id": doc_id,
+            "chunks": len(chunks),
+            "characters": len(extracted_text),
+            "session_id": session_id,
+            "url": f"/uploads/{saved_filename}",
+            "message": f"Successfully processed {filename} ({len(chunks)} chunks indexed)",
+        })
+
+    except Exception as e:
+        print(f"[upload][ERROR] {e!r}")
+        return jsonify({"error": f"Upload failed: {e!s}"}), 500
+
+
+@app.route("/uploads/<filename>")
+def serve_upload(filename):
+    """Serve uploaded files."""
+    from flask import send_from_directory
+    return send_from_directory(UPLOAD_DIR, filename)
+
+
+@app.route("/session/<session_id>/documents", methods=["GET"])
+def get_session_documents(session_id):
+    """Get list of documents uploaded to a session."""
+    docs = SESSION_DOCUMENTS.get(session_id, [])
+    return jsonify({"documents": docs})
+
+
+# ==================== WebSocket Events ====================
+
+
+@socketio.on("connect")
+def handle_connect():
+    """Handle WebSocket connection."""
+    print(f"[ws] Client connected: {request.sid}")
+    emit("connected", {"status": "ok", "sid": request.sid})
+
+
+@socketio.on("disconnect")
+def handle_disconnect():
+    """Handle WebSocket disconnection."""
+    print(f"[ws] Client disconnected: {request.sid}")
+
+
+@socketio.on("join")
+def handle_join(data):
+    """Join a chat room."""
+    room = data.get("room")
+    if room:
+        join_room(room)
+        emit("joined", {"room": room}, room=room)
+
+
+@socketio.on("chat_message")
+def handle_chat_message(data):
+    """Handle real-time chat messages via WebSocket."""
+    if client is None:
+        emit("error", {"message": "LLM backend not configured"})
+        return
+
+    user_msg = (data.get("message") or "").strip()
+    session_id = data.get("session_id")
+
+    if not user_msg:
+        emit("error", {"message": "Empty message"})
+        return
+
+    # Emit typing indicator
+    emit("typing", {"status": True})
+
+    try:
+        top_k = int(data.get("top_k", 5))
+        retrieved = search_azure(user_msg, top_k)
+        if not retrieved and search_client is None:
+            retrieved = vs.search(user_msg, k=top_k)
+
+        messages = build_hybrid_messages(user_msg, retrieved)
+
+        response = client.chat.completions.create(
             model=AZURE_OPENAI_DEPLOYMENT,
             messages=messages,
             max_tokens=800,
             temperature=0.0,
             top_p=0.95,
         )
-        ai_msg = resp.choices[0].message.content
-
-        s["messages"].append({"role": "assistant", "content": ai_msg, "meta": {}})
-
-        # Store section-wise memory (Q&A pair)
-        s["sections"].append(
-            {
-                "timestamp": datetime.utcnow().isoformat(),
-                "query": user_msg,
-                "answer": ai_msg,
-            }
-        )
+        ai_msg = response.choices[0].message.content
 
         sources = [
-            {
-                "doc_id": r["doc_id"],
-                "source": r["meta"].get("source"),
-                "score": float(r["score"]),
-            }
+            {"doc_id": r["doc_id"], "source": r["meta"].get("source")}
             for r in retrieved
         ]
 
-        return jsonify(
+        emit("typing", {"status": False})
+        emit(
+            "chat_response",
             {
-                "session_id": session_id,
+                "id": str(uuid4()),
                 "response": ai_msg,
                 "sources": sources,
-            }
+                "session_id": session_id,
+            },
         )
+
     except Exception as e:
-        print("[chat_session][ERROR]", repr(e))
-        s["messages"].append(
-            {"role": "assistant", "content": f"Backend error: {e}", "meta": {}}
-        )
-        return jsonify({"error": str(e)}), 500
+        emit("typing", {"status": False})
+        emit("error", {"message": f"Backend error: {e!s}"})
+        print(f"[ws][ERROR] {e!r}")
 
 
-# ---- start server when run directly ----
+# ==================== Entry Point ====================
+
+def find_available_port(host: str = "0.0.0.0", start_port: int = 8000, max_port: int = 8010) -> int:
+    """Find an available port in the given range (development only)."""
+    import socket
+    import time
+    
+    for try_port in range(start_port, max_port + 1):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, try_port))
+            sock.close()
+            if try_port != start_port:
+                print(f"[startup] Port {start_port} busy, using port {try_port}")
+            return try_port
+        except OSError:
+            sock.close()
+            print(f"[startup] Port {try_port} is busy, trying next...")
+            time.sleep(1)
+    
+    return None
+
+
 if __name__ == "__main__":
-    import sys
-
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", 8000))
-    debug_env = os.getenv("FLASK_DEBUG", "1")
-    debug = True if debug_env.lower() in ("1", "true", "yes") else False
-
+    host = "0.0.0.0"
+    
+    if IS_PRODUCTION:
+        # ===== PRODUCTION (Azure App Service) =====
+        port = int(os.environ.get("PORT", 8000))
+        debug = False
+        display_host = host
+        print(f"[startup] Production mode: PORT={port}, DEBUG=False")
+    else:
+        # ===== DEVELOPMENT =====
+        port = find_available_port(host)
+        debug = True
+        display_host = "127.0.0.1"
+        
+        if port is None:
+            print("")
+            print("=" * 60)
+            print("  ERROR: All ports 8000-8010 are in use!")
+            print("=" * 60)
+            print("")
+            print("  To fix this on Windows, run:")
+            print("    netstat -ano | findstr :8000")
+            print("    taskkill /PID <pid> /F")
+            print("")
+            print("  Or specify a different port:")
+            print("    set PORT=9000 && python app.py")
+            print("=" * 60)
+            exit(1)
+    
+    # Print startup banner
+    version = read_version()
+    print("")
+    print("=" * 60)
+    print(f"  SageAlpha.ai v{version}")
+    print(f"  Environment: {'Production' if IS_PRODUCTION else 'Development'}")
+    print("=" * 60)
+    print(f"  Server: http://{display_host}:{port}")
+    print(f"  Debug: {debug}")
+    print("")
+    print("  Press CTRL+C to quit")
+    print("=" * 60)
+    print("")
+    
     try:
-        with app.app_context():
-            db.create_all()
-            seed_demo_users()
-            print("[startup] Database tables ensured (sqlite) and demo users seeded.")
+        socketio.run(
+            app,
+            host=host,
+            port=port,
+            debug=debug,
+            use_reloader=False,
+            allow_unsafe_werkzeug=not IS_PRODUCTION,
+        )
+    except KeyboardInterrupt:
+        print("\n[shutdown] Server stopped by user")
     except Exception as e:
-        print("[startup][WARN] Failed to create DB tables or seed users:", repr(e))
-
-    print(f"[startup] Starting Flask app on http://{host}:{port}  (debug={debug})")
-    try:
-        app.run(host=host, port=port, debug=debug, use_reloader=False)
-    except Exception as e:
-        print("[startup][ERROR] Failed to start Flask:", repr(e))
-        sys.exit(1)
+        print(f"\n[ERROR] Server failed: {e}")
+        exit(1)

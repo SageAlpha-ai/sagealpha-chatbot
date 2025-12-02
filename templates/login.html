@@ -1,156 +1,348 @@
-<!-- templates/login.html -->
-<!doctype html>
-<html lang="en">
+<!DOCTYPE html>
+<html lang="en" class="h-full">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>SageAlpha — Sign in</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SageAlpha.ai — Sign in</title>
+  
+  <!-- Tailwind CSS 3.x CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            sage: {
+              50: '#faf5ff',
+              100: '#f3e8ff',
+              200: '#e9d5ff',
+              300: '#d8b4fe',
+              400: '#c084fc',
+              500: '#a855f7',
+              600: '#9333ea',
+              700: '#7c3aed',
+              800: '#6b21a8',
+              900: '#581c87',
+            },
+            primary: '#8B5CF6',
+          },
+          fontFamily: {
+            display: ['Clash Display', 'system-ui', 'sans-serif'],
+            sans: ['Satoshi', 'Inter', 'system-ui', 'sans-serif'],
+          },
+          animation: {
+            'float': 'float 6s ease-in-out infinite',
+            'glow': 'glow 2s ease-in-out infinite alternate',
+            'slide-up': 'slideUp 0.5s ease-out',
+          },
+          keyframes: {
+            float: {
+              '0%, 100%': { transform: 'translateY(0)' },
+              '50%': { transform: 'translateY(-10px)' },
+            },
+            glow: {
+              '0%': { boxShadow: '0 0 20px rgba(139, 92, 246, 0.3)' },
+              '100%': { boxShadow: '0 0 40px rgba(139, 92, 246, 0.6)' },
+            },
+            slideUp: {
+              '0%': { opacity: '0', transform: 'translateY(20px)' },
+              '100%': { opacity: '1', transform: 'translateY(0)' },
+            }
+          }
+        }
+      }
+    }
+  </script>
+  
+  <!-- Alpine.js -->
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  
+  <!-- HTMX -->
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  
+  <style>
+    @import url('https://api.fontshare.com/v2/css?f[]=satoshi@400,500,700&f[]=clash-display@600,700&display=swap');
+    
+    body {
+      font-family: 'Satoshi', 'Inter', system-ui, sans-serif;
+    }
+    
+    .glass-card {
+      background: rgba(255, 255, 255, 0.08);
+      backdrop-filter: blur(24px);
+      -webkit-backdrop-filter: blur(24px);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+    }
+    
+    .gradient-bg {
+      background: linear-gradient(135deg, 
+        #1e1b4b 0%, 
+        #312e81 25%, 
+        #5b21b6 50%, 
+        #7c3aed 75%, 
+        #a855f7 100%
+      );
+      background-size: 400% 400%;
+      animation: gradient-shift 15s ease infinite;
+    }
+    
+    @keyframes gradient-shift {
+      0% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+    
+    .input-glow:focus {
+      box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.3), 0 0 20px rgba(139, 92, 246, 0.15);
+    }
+    
+    .btn-primary {
+      background: linear-gradient(135deg, #8B5CF6 0%, #7C3AED 50%, #6D28D9 100%);
+      transition: all 0.3s ease;
+    }
+    
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 10px 40px rgba(139, 92, 246, 0.4);
+    }
+    
+    .btn-primary:active {
+      transform: translateY(0);
+    }
+    
+    .floating-orb {
+      position: absolute;
+      border-radius: 50%;
+      filter: blur(60px);
+      opacity: 0.4;
+      animation: float 8s ease-in-out infinite;
+    }
+    
+    .orb-1 {
+      width: 400px;
+      height: 400px;
+      background: #8B5CF6;
+      top: -100px;
+      left: -100px;
+      animation-delay: 0s;
+    }
+    
+    .orb-2 {
+      width: 300px;
+      height: 300px;
+      background: #A855F7;
+      bottom: -50px;
+      right: -50px;
+      animation-delay: 2s;
+    }
+    
+    .orb-3 {
+      width: 200px;
+      height: 200px;
+      background: #C084FC;
+      top: 40%;
+      right: 10%;
+      animation-delay: 4s;
+    }
+  </style>
 </head>
-<body>
-  {% set show_register = show_register | default(false) %}
 
-  <div class="login-page">
-    <div class="login-card" role="main" aria-labelledby="loginTitle">
-      <div class="login-logo">
-        <img src="{{ url_for('static', filename='img/sagealpha-logo.png') }}" alt="SageAlpha" />
+<body class="h-full gradient-bg overflow-hidden">
+  <!-- Floating Orbs Background -->
+  <div class="floating-orb orb-1"></div>
+  <div class="floating-orb orb-2"></div>
+  <div class="floating-orb orb-3"></div>
+  
+  <!-- Main Container -->
+  <div class="min-h-full flex items-center justify-center p-4 relative z-10"
+       x-data="{ 
+         showRegister: {{ 'true' if show_register else 'false' }},
+         showPassword: false,
+         loading: false
+       }">
+    
+    <div class="w-full max-w-md animate-slide-up">
+      <!-- Logo -->
+      <div class="text-center mb-8">
+        <div class="inline-flex items-center justify-center mb-4 animate-float">
+          <img src="{{ url_for('static', filename='img/sagealpha-logo.png') }}" 
+               alt="SageAlpha" 
+               class="h-12 w-auto drop-shadow-2xl"
+               onerror="this.style.display='none'">
+        </div>
+        <h1 class="font-display text-3xl font-bold text-white tracking-tight">
+          SageAlpha<span class="text-sage-400">.ai</span>
+        </h1>
+        <p class="text-sage-200/70 text-sm mt-2">
+          AI-Powered Equity Research Platform
+        </p>
       </div>
-
-      <h1 id="loginTitle" class="login-title">
-        {% if show_register %}Create your SageAlpha account{% else %}Sign in to SageAlpha{% endif %}
-      </h1>
-
-      <!-- SIGN IN FORM -->
-      <form id="loginForm"
-            class="login-form"
-            method="post"
-            action="{{ url_for('login') }}"
-            autocomplete="on"
-            {% if show_register %}hidden{% endif %}>
-
-        <label for="username" class="form-label">Username</label>
-        <input id="username"
-               name="username"
-               class="form-input"
-               type="text"
-               autocomplete="username"
-               value="{{ username | default('') }}"
-               required />
-
-        <label for="password" class="form-label">Password</label>
-        <div class="password-row">
-          <input id="password"
-                 name="password"
-                 class="form-input password-input"
-                 type="password"
-                 autocomplete="current-password"
-                 required
-                 aria-describedby="showPwdHelp" />
-          <button type="button"
-                  id="togglePassword"
-                  class="password-toggle"
-                  aria-pressed="false"
-                  aria-label="Show password">
-            <svg id="eyeIcon"
-                 xmlns="http://www.w3.org/2000/svg"
-                 width="18" height="18"
-                 viewBox="0 0 24 24"
-                 fill="none"
-                 stroke="currentColor"
-                 stroke-width="1.6"
-                 stroke-linecap="round"
-                 stroke-linejoin="round"
-                 aria-hidden="true">
-              <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"></path>
-              <circle cx="12" cy="12" r="3"></circle>
-            </svg>
+      
+      <!-- Card -->
+      <div class="glass-card rounded-3xl p-8 shadow-2xl animate-glow">
+        
+        <!-- Tab Headers -->
+        <div class="flex mb-8 bg-white/5 rounded-2xl p-1">
+          <button @click="showRegister = false"
+                  :class="!showRegister ? 'bg-white/10 text-white shadow-lg' : 'text-sage-300 hover:text-white'"
+                  class="flex-1 py-3 px-4 rounded-xl text-sm font-semibold transition-all duration-300">
+            Sign In
+          </button>
+          <button @click="showRegister = true"
+                  :class="showRegister ? 'bg-white/10 text-white shadow-lg' : 'text-sage-300 hover:text-white'"
+                  class="flex-1 py-3 px-4 rounded-xl text-sm font-semibold transition-all duration-300">
+            Create Account
           </button>
         </div>
-
-        <div id="loginError"
-             class="form-error"
-             role="alert"
-             aria-live="polite"
-             {% if not error %}hidden{% endif %}>
-          {{ error }}
-        </div>
-
-        <button id="signinBtn" class="btn-primary" type="submit">Sign in</button>
-
-        <div class="login-footer">
-          <small>Local test users:
-            <strong>demouser</strong> /
-            <strong>devuser</strong> /
-            <strong>produser</strong>
-          </small>
-        </div>
-
-        <div class="login-switch">
-          <span>New to SageAlpha?</span>
-          <button type="button" id="showRegister" class="link-button">Create an account</button>
-        </div>
-      </form>
-
-      <!-- SIGN UP FORM -->
-      <form id="registerForm"
-            class="login-form"
-            method="post"
-            action="{{ url_for('register') }}"
-            autocomplete="on"
-            {% if not show_register %}hidden{% endif %}>
-
-        <label for="reg_username" class="form-label">Username</label>
-        <input id="reg_username"
-               name="username"
-               class="form-input"
-               type="text"
-               autocomplete="username"
-               value="{{ reg_username | default('') }}"
-               required />
-
-        <label for="reg_display_name" class="form-label">Full name (optional)</label>
-        <input id="reg_display_name"
-               name="display_name"
-               class="form-input"
-               type="text"
-               autocomplete="name"
-               value="{{ reg_display_name | default('') }}" />
-
-        <label for="reg_password" class="form-label">Password</label>
-        <input id="reg_password"
-               name="password"
-               class="form-input"
-               type="password"
-               autocomplete="new-password"
-               required />
-
-        <label for="reg_password_confirm" class="form-label">Confirm password</label>
-        <input id="reg_password_confirm"
-               name="confirm_password"
-               class="form-input"
-               type="password"
-               autocomplete="new-password"
-               required />
-
-        <div id="registerError"
-             class="form-error"
-             role="alert"
-             aria-live="polite"
-             {% if not register_error %}hidden{% endif %}>
-          {{ register_error }}
-        </div>
-
-        <button class="btn-primary" type="submit">Create account</button>
-
-        <div class="login-switch">
-          <span>Already have an account?</span>
-          <button type="button" id="showLogin" class="link-button">Back to sign in</button>
-        </div>
-      </form>
-
+        
+        <!-- Sign In Form -->
+        <form x-show="!showRegister"
+              x-transition:enter="transition ease-out duration-300"
+              x-transition:enter-start="opacity-0 transform -translate-x-4"
+              x-transition:enter-end="opacity-100 transform translate-x-0"
+              method="post" 
+              action="/login"
+              class="space-y-5">
+          
+          {% if error %}
+          <div class="bg-red-500/10 border border-red-500/30 rounded-xl p-4 text-red-200 text-sm flex items-start gap-3"
+               role="alert">
+            <svg class="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" fill="currentColor" viewBox="0 0 20 20">
+              <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd"/>
+            </svg>
+            <span>{{ error }}</span>
+          </div>
+          {% endif %}
+          
+          <div>
+            <label class="block text-sage-200 text-sm font-medium mb-2">Username</label>
+            <input type="text" 
+                   name="username" 
+                   value="{{ username | default('') }}"
+                   required
+                   autocomplete="username"
+                   class="w-full px-4 py-3.5 bg-white/5 border border-white/10 rounded-xl text-white placeholder-sage-400/50 focus:outline-none input-glow transition-all duration-300"
+                   placeholder="Enter your username">
+          </div>
+          
+          <div>
+            <label class="block text-sage-200 text-sm font-medium mb-2">Password</label>
+            <div class="relative">
+              <input :type="showPassword ? 'text' : 'password'" 
+                     name="password" 
+                     required
+                     autocomplete="current-password"
+                     class="w-full px-4 py-3.5 bg-white/5 border border-white/10 rounded-xl text-white placeholder-sage-400/50 focus:outline-none input-glow transition-all duration-300 pr-12"
+                     placeholder="Enter your password">
+              <button type="button"
+                      @click="showPassword = !showPassword"
+                      class="absolute right-4 top-1/2 -translate-y-1/2 text-sage-400 hover:text-white transition-colors">
+                <svg x-show="!showPassword" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/>
+                </svg>
+                <svg x-show="showPassword" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="display: none;">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+          
+          <button type="submit"
+                  class="w-full btn-primary text-white font-semibold py-4 rounded-xl shadow-lg mt-6">
+            Sign In
+          </button>
+          
+          <!-- Demo Users Notice -->
+          <div class="text-center pt-4 border-t border-white/10 mt-6">
+            <p class="text-sage-300/60 text-xs">
+              Demo accounts: <span class="text-sage-300">demouser</span> / 
+              <span class="text-sage-300">devuser</span> / 
+              <span class="text-sage-300">produser</span>
+            </p>
+          </div>
+        </form>
+        
+        <!-- Register Form -->
+        <form x-show="showRegister"
+              x-transition:enter="transition ease-out duration-300"
+              x-transition:enter-start="opacity-0 transform translate-x-4"
+              x-transition:enter-end="opacity-100 transform translate-x-0"
+              method="post" 
+              action="/register"
+              class="space-y-5"
+              style="display: none;">
+          
+          {% if register_error %}
+          <div class="bg-red-500/10 border border-red-500/30 rounded-xl p-4 text-red-200 text-sm flex items-start gap-3"
+               role="alert">
+            <svg class="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" fill="currentColor" viewBox="0 0 20 20">
+              <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd"/>
+            </svg>
+            <span>{{ register_error }}</span>
+          </div>
+          {% endif %}
+          
+          <div>
+            <label class="block text-sage-200 text-sm font-medium mb-2">Username</label>
+            <input type="text" 
+                   name="username" 
+                   value="{{ reg_username | default('') }}"
+                   required
+                   autocomplete="username"
+                   class="w-full px-4 py-3.5 bg-white/5 border border-white/10 rounded-xl text-white placeholder-sage-400/50 focus:outline-none input-glow transition-all duration-300"
+                   placeholder="Choose a username">
+          </div>
+          
+          <div>
+            <label class="block text-sage-200 text-sm font-medium mb-2">Display Name <span class="text-sage-400/50">(optional)</span></label>
+            <input type="text" 
+                   name="display_name" 
+                   value="{{ reg_display_name | default('') }}"
+                   autocomplete="name"
+                   class="w-full px-4 py-3.5 bg-white/5 border border-white/10 rounded-xl text-white placeholder-sage-400/50 focus:outline-none input-glow transition-all duration-300"
+                   placeholder="Your full name">
+          </div>
+          
+          <div>
+            <label class="block text-sage-200 text-sm font-medium mb-2">Password</label>
+            <input type="password" 
+                   name="password" 
+                   required
+                   autocomplete="new-password"
+                   minlength="8"
+                   class="w-full px-4 py-3.5 bg-white/5 border border-white/10 rounded-xl text-white placeholder-sage-400/50 focus:outline-none input-glow transition-all duration-300"
+                   placeholder="Min. 8 characters">
+          </div>
+          
+          <div>
+            <label class="block text-sage-200 text-sm font-medium mb-2">Confirm Password</label>
+            <input type="password" 
+                   name="confirm_password" 
+                   required
+                   autocomplete="new-password"
+                   class="w-full px-4 py-3.5 bg-white/5 border border-white/10 rounded-xl text-white placeholder-sage-400/50 focus:outline-none input-glow transition-all duration-300"
+                   placeholder="Confirm your password">
+          </div>
+          
+          <button type="submit"
+                  class="w-full btn-primary text-white font-semibold py-4 rounded-xl shadow-lg mt-6">
+            Create Account
+          </button>
+        </form>
+        
+      </div>
+      
+      <!-- Footer -->
+      <div class="text-center mt-8 text-sage-300/50 text-xs">
+        <p>SageAlpha.ai v{{ APP_VERSION }} &copy; 2025</p>
+      </div>
     </div>
   </div>
-
-  <script src="{{ url_for('static', filename='js/login.js') }}"></script>
 </body>
 </html>
